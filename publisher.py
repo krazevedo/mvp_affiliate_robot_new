@@ -7,6 +7,7 @@ from typing import Optional
 import requests
 
 TELEGRAM_API = "https://api.telegram.org"
+MIN_SALES_DISPLAY = 50  # novo limiar
 
 def with_utm(link: str, campaign: str, sub_id: Optional[str] = None) -> str:
     from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
@@ -43,8 +44,8 @@ def _fmt_sales_br(sales: Optional[int]) -> str:
         s = int(sales)
     except Exception:
         return ""
-    if s <= 0:
-        return ""
+    if s < MIN_SALES_DISPLAY:
+        return ""  # oculta prova social fraca
     if s >= 1000:
         k = s / 1000.0
         k_str = f"{k:.1f}".rstrip("0").rstrip(".").replace(".", ",")

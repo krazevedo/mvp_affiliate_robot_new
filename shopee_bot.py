@@ -2,7 +2,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-shopee_bot.py — GraphQL + IA A/B + blocklist + diversidade + dedupe + pós-processador de copy
+shopee_bot.py — GraphQL + IA A/B + blocklist + diversidade + dedupe
++ pós-processador de copy com:
+  - remoção de CTA na copy (CTA só no botão)
+  - evitar rating/%OFF/vendas na copy (fica no rodapé)
+  - injeção de "hint" (ex.: 2400 DPI, IP67, 4L, 360°) quando houver
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ logger = logging.getLogger("shopee_bot")
 AFFILIATE_ENDPOINT = "https://open-api.affiliate.shopee.com.br/graphql"
 DEFAULT_CONNECT_TIMEOUT = 8
 DEFAULT_READ_TIMEOUT = 20
-USER_AGENT = "OfferBot/1.2 (+https://github.com/yourrepo)"
+USER_AGENT = "OfferBot/1.3 (+https://github.com/yourrepo)"
 
 def make_session() -> requests.Session:
     s = requests.Session()
@@ -146,7 +150,7 @@ def coletar_ofertas(partner_id:int, api_key:str, *, keywords:List[str], shop_ids
         logger.info("Buscando %s=%r ...", fonte["tipo"], fonte["valor"])
         for page in range(1, paginas+1):
             try:
-                data = graphql_product_offer_v2(partner_id, api_key, keyword=str(fonte["valor"]), limit=itens_por_pagina, page=page) if fonte["tipo"]=="keyword"                        else graphql_product_offer_v2(partner_id, api_key, shop_id=int(fonte["valor"]), limit=itens_por_pagina, page=page)
+                data = graphql_product_offer_v2(partner_id, api_key, keyword=str(fonte["valor"]), limit=itens_por_pagina, page=page) if fonte["tipo"]=="keyword"                            else graphql_product_offer_v2(partner_id, api_key, shop_id=int(fonte["valor"]), limit=itens_por_pagina, page=page)
             except requests.HTTPError as he:
                 msg=getattr(he.response,"text",str(he)); logger.warning("HTTPError page=%s: %s", page, msg); break
             except Exception as e:
@@ -190,31 +194,60 @@ def filter_candidates(products: List[Dict[str,Any]], *, min_rating: float, min_d
             out.append(p)
     return out
 
-# --------- Sanitize/enforce da copy ---------
+# --------- Copy guardrails ---------
 PRICE_PAT = re.compile(r"(r\$\s?\d+[\.,]?\d*)|(%\s?off)", re.IGNORECASE)
 STAR_PAT  = re.compile(r"(\d[\.,]?\d\s*estrelas?)|(avalia[cç][aã]o\s*\d[\.,]?\d)", re.IGNORECASE)
 SALES_PAT = re.compile(r"(\d+\+?\s*vendas?)", re.IGNORECASE)
+CTA_PAT   = re.compile(r"\b(aproveite(?: agora)?|garanta a sua|ver oferta|compre agora)\b[\.!]?", re.IGNORECASE)
+URGENCY_TAIL = re.compile(r"(agora|enquanto dura|estoque limitado|últimas unidades|por tempo limitado)[\.!]?$", re.IGNORECASE)
+
+SPEC_PATTERNS = [
+    (re.compile(r"\b(\d{3,5})\s*dpi\b", re.IGNORECASE), lambda m: f"{m.group(1)} DPI"),
+    (re.compile(r"\b(ip(?:6[7-9]|x?8))\b", re.IGNORECASE), lambda m: m.group(1).upper()),
+    (re.compile(r"\b(\d+)\s*l\b", re.IGNORECASE), lambda m: f"{m.group(1)}L"),
+    (re.compile(r"\b360\b"), lambda m: "rotação 360°"),
+    (re.compile(r"\bbluetooth\b", re.IGNORECASE), lambda m: "Bluetooth"),
+    (re.compile(r"\banc\b|\bnoise\b", re.IGNORECASE), lambda m: "cancelamento de ruído"),
+]
+
+def derive_hint(name: str) -> Optional[str]:
+    n = name or ""
+    for pat, fmt in SPEC_PATTERNS:
+        m = pat.search(n)
+        if m:
+            try:
+                return fmt(m)
+            except Exception:
+                continue
+    return None
 
 def sanitize_copy(text: str) -> str:
     t = text or ""
     t = PRICE_PAT.sub("", t)
     t = STAR_PAT.sub("", t)
     t = SALES_PAT.sub("", t)
+    t = CTA_PAT.sub("", t)   # CTA só no botão
     t = re.sub(r"\s{2,}", " ", t).strip()
+    t = re.sub(r"[\.!\?]{2,}$", ".", t)
     return t
 
-def enforce_style(text: str, product_name: str, category: str) -> str:
+def enforce_style(text: str, product_name: str, category: str, hint: Optional[str]=None) -> str:
     t = sanitize_copy(text)
     # precisa mencionar produto ou categoria
     pn = (product_name or "").strip()
     if pn and pn[:8].lower() not in t.lower() and (category or "").lower() not in t.lower():
         t = f"{pn}: {t}"
-    # tamanho alvo 100-170 chars (sem ser rígido)
-    if len(t) < 90:
+    # inserir hint se útil
+    if hint and hint.lower() not in t.lower() and len(t) < 120:
+        if ": " in t[:60]:
+            t = t.replace(": ", f": {hint} — ", 1)
+        else:
+            t = f"{t} — {hint}"
+    # decidir se adiciona um fechamento curto
+    if not URGENCY_TAIL.search(t) and len(t) < 90:
         t = (t + " Aproveite.").strip()
     if len(t) > 170:
         t = t[:165].rsplit(" ",1)[0] + "..."
-    # normalizar pontuação
     t = re.sub(r"!{2,}", "!", t)
     return t
 
@@ -254,7 +287,8 @@ def publish_ranked_ab(pub:TelegramPublisher, db:Storage, ranked:List[Tuple[float
 
         pname = str(prod.get("productName") or "")
         cat = tag_categoria(pname)
-        texto = enforce_style(raw_text, pname, cat)
+        hint = derive_hint(pname)
+        texto = enforce_style(raw_text, pname, cat, hint=hint)
 
         price=float(prod.get("priceMin") or 0.0)
         shop=str(prod.get("shopName") or "")
@@ -347,8 +381,8 @@ def main():
         except Exception as e:
             logger.exception("Falha IA no lote %s: %s", (i//BATCH)+1, e)
             tmp=[{"itemId": int(p["itemId"]), "pontuacao": 50,
-                  "texto_de_venda_a": f"{p.get('productName','Oferta')}: bom custo-benefício pra usar no dia a dia. Aproveite!",
-                  "texto_de_venda_b": f"{p.get('productName','Oferta')}: destaque entre os mais buscados. Pegue com desconto enquanto dura."}
+                  "texto_de_venda_a": f"{p.get('productName','Oferta')}: bom custo-benefício pra usar no dia a dia.",
+                  "texto_de_venda_b": f"{p.get('productName','Oferta')}: destaque entre os mais buscados."}
                  for p in batch]
             resp=IAResponse(analise_de_produtos=[IAItem(**x) for x in tmp])
             ia_results.extend([x.model_dump() for x in resp.analise_de_produtos])
