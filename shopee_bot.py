@@ -14,9 +14,9 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from storage import Storage
-from publisher import TelegramPublisher
+from shopee_monorepo_modules.publisher import TelegramPublisher
 from ai import analyze_products, IAResponse, IAItem
-from ev_signal import compute_ev_signal
+from shopee_monorepo_modules.ev_signal import compute_ev_signal
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),

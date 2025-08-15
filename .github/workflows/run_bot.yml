@@ -8,7 +8,6 @@ on:
         type: boolean
         default: false
   schedule:
-    # GitHub usa UTC. Estes horários são 10:05 e 17:05 em America/Sao_Paulo (UTC-3).
     - cron: "5 13 * * *"
     - cron: "5 20 * * *"
   push:
@@ -27,14 +26,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Secrets obrigatórios
       SHOPEE_PARTNER_ID: ${{ secrets.SHOPEE_PARTNER_ID }}
       SHOPEE_API_KEY: ${{ secrets.SHOPEE_API_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-      # Config do bot
       DB_PATH: data/bot.db
       QUANTIDADE_DE_POSTS_POR_EXECUCAO: 6
       PAGINAS_A_VERIFICAR: 2
@@ -44,7 +41,6 @@ jobs:
       MIN_IA_SCORE: "65"
       COOLDOWN_REPOSTAGEM_DIAS: "5"
       MAX_CATEGORY_SHARE: "0.5"
-      # DRY_RUN herdado do dispatch (fallback: 0)
       DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
 
     steps:
@@ -75,9 +71,13 @@ jobs:
           restore-keys: |
             bot-db-
 
-      - name: Ensure folders
+      - name: Ensure folders & package init
         run: |
           mkdir -p data sql_migrations shopee_monorepo_modules
+          # garante import absoluto mesmo sem namespace package
+          if [ ! -f shopee_monorepo_modules/__init__.py ]; then
+            echo "" > shopee_monorepo_modules/__init__.py
+          fi
 
       - name: Apply DB migration via Python (no sqlite3 CLI)
         run: |
