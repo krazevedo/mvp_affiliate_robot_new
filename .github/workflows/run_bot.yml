@@ -67,12 +67,12 @@ jobs:
 
       # --- Parâmetros com fallback (workflow_dispatch > vars > defaults) ---
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRY_RUN || 'false' }}
-      QUANTIDADE_DE_POSTS_POR_EXECUCAO: ${{ github.event_name == 'workflow_dispatch' && inputs.QTD_POSTS || vars.QTD_POSTS || '6' }}
+      QUANTIDADE_DE_POSTS_POR_EXECUCAO: ${{ github.event_name == 'workflow_dispatch' && inputs.QTD_POSTS || vars.QTD_POSTS || '3' }}
       PAGINAS_A_VERIFICAR: ${{ github.event_name == 'workflow_dispatch' && inputs.PAGINAS_A_VERIFICAR || vars.PAGINAS_A_VERIFICAR || '2' }}
-      ITENS_POR_PAGINA: ${{ github.event_name == 'workflow_dispatch' && inputs.ITENS_POR_PAGINA || vars.ITENS_POR_PAGINA || '15' }}
+      ITENS_POR_PAGINA: ${{ github.event_name == 'workflow_dispatch' && inputs.ITENS_POR_PAGINA || vars.ITENS_POR_PAGINA || '30' }}
       MIN_RATING: ${{ github.event_name == 'workflow_dispatch' && inputs.MIN_RATING || vars.MIN_RATING || '4.7' }}
       MIN_DISCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.MIN_DISCOUNT || vars.MIN_DISCOUNT || '0.15' }}
-      MIN_IA_SCORE: ${{ github.event_name == 'workflow_dispatch' && inputs.MIN_IA_SCORE || vars.MIN_IA_SCORE || '65' }}
+      MIN_IA_SCORE: ${{ github.event_name == 'workflow_dispatch' && inputs.MIN_IA_SCORE || vars.MIN_IA_SCORE || '75' }}
       MAX_CATEGORY_SHARE: ${{ github.event_name == 'workflow_dispatch' && inputs.MAX_CATEGORY_SHARE || vars.MAX_CATEGORY_SHARE || '0.4' }}
       BLOCKLIST_TERMS: ${{ github.event_name == 'workflow_dispatch' && inputs.BLOCKLIST_TERMS || vars.BLOCKLIST_TERMS || 'espi,espiã,pmpo,chatgpt,4k,i12' }}
 
@@ -83,6 +83,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Restore DB cache
+        uses: actions/cache@v4
+        with:
+          path: data/bot.db
+          key: botdb-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            botdb-${{ github.ref_name }}-
+            botdb-
+
+      - name: Ensure data dir
+        run: mkdir -p data
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -95,15 +107,11 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Ensure data dir
-        run: mkdir -p data
-
       - name: Run bot
         run: |
-          set -e
           python shopee_bot.py 2>&1 | tee run.log
 
-      - name: Upload DB and logs
+      - name: Upload DB and logs (artifact)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:

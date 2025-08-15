@@ -1,7 +1,8 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-shopee_bot.py — Orquestrador c/ GraphQL + IA A/B + blocklist + diversidade por categoria + dedupe por nome
+shopee_bot.py — GraphQL + IA A/B + blocklist + diversidade + dedupe + pós-processador de copy
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ logger = logging.getLogger("shopee_bot")
 AFFILIATE_ENDPOINT = "https://open-api.affiliate.shopee.com.br/graphql"
 DEFAULT_CONNECT_TIMEOUT = 8
 DEFAULT_READ_TIMEOUT = 20
-USER_AGENT = "OfferBot/1.1 (+https://github.com/yourrepo)"
+USER_AGENT = "OfferBot/1.2 (+https://github.com/yourrepo)"
 
 def make_session() -> requests.Session:
     s = requests.Session()
@@ -93,18 +94,18 @@ def graphql_product_offer_v2(partner_id: int, api_key: str, *, keyword: Optional
     payload=json.dumps(body, separators=(",",":"))
     auth,_=_build_auth_header(partner_id, api_key, payload)
     headers={"Authorization":auth,"Content-Type":"application/json"}
-    r=SESSION.post("https://open-api.affiliate.shopee.com.br/graphql", data=payload, headers=headers, timeout=(8,20))
+    r=SESSION.post(AFFILIATE_ENDPOINT, data=payload, headers=headers, timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT))
     r.raise_for_status()
     return r.json()
 
 def verificar_link_ativo(url: str) -> bool:
     if not url: return False
     try:
-        r=SESSION.head(url, allow_redirects=True, timeout=(8,20), headers={"User-Agent":USER_AGENT})
+        r=SESSION.head(url, allow_redirects=True, timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT), headers={"User-Agent":USER_AGENT})
         if 200<=r.status_code<400: return True
     except: pass
     try:
-        r=SESSION.get(url, allow_redirects=True, timeout=(8,20), headers={"User-Agent":USER_AGENT})
+        r=SESSION.get(url, allow_redirects=True, timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT), headers={"User-Agent":USER_AGENT})
         return (200<=r.status_code<400) and ("O produto não existe" not in r.text)
     except: return False
 
@@ -145,8 +146,7 @@ def coletar_ofertas(partner_id:int, api_key:str, *, keywords:List[str], shop_ids
         logger.info("Buscando %s=%r ...", fonte["tipo"], fonte["valor"])
         for page in range(1, paginas+1):
             try:
-                data = graphql_product_offer_v2(partner_id, api_key, keyword=str(fonte["valor"]), limit=itens_por_pagina, page=page) if fonte["tipo"]=="keyword" \
-                       else graphql_product_offer_v2(partner_id, api_key, shop_id=int(fonte["valor"]), limit=itens_por_pagina, page=page)
+                data = graphql_product_offer_v2(partner_id, api_key, keyword=str(fonte["valor"]), limit=itens_por_pagina, page=page) if fonte["tipo"]=="keyword"                        else graphql_product_offer_v2(partner_id, api_key, shop_id=int(fonte["valor"]), limit=itens_por_pagina, page=page)
             except requests.HTTPError as he:
                 msg=getattr(he.response,"text",str(he)); logger.warning("HTTPError page=%s: %s", page, msg); break
             except Exception as e:
@@ -190,6 +190,34 @@ def filter_candidates(products: List[Dict[str,Any]], *, min_rating: float, min_d
             out.append(p)
     return out
 
+# --------- Sanitize/enforce da copy ---------
+PRICE_PAT = re.compile(r"(r\$\s?\d+[\.,]?\d*)|(%\s?off)", re.IGNORECASE)
+STAR_PAT  = re.compile(r"(\d[\.,]?\d\s*estrelas?)|(avalia[cç][aã]o\s*\d[\.,]?\d)", re.IGNORECASE)
+SALES_PAT = re.compile(r"(\d+\+?\s*vendas?)", re.IGNORECASE)
+
+def sanitize_copy(text: str) -> str:
+    t = text or ""
+    t = PRICE_PAT.sub("", t)
+    t = STAR_PAT.sub("", t)
+    t = SALES_PAT.sub("", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+def enforce_style(text: str, product_name: str, category: str) -> str:
+    t = sanitize_copy(text)
+    # precisa mencionar produto ou categoria
+    pn = (product_name or "").strip()
+    if pn and pn[:8].lower() not in t.lower() and (category or "").lower() not in t.lower():
+        t = f"{pn}: {t}"
+    # tamanho alvo 100-170 chars (sem ser rígido)
+    if len(t) < 90:
+        t = (t + " Aproveite.").strip()
+    if len(t) > 170:
+        t = t[:165].rsplit(" ",1)[0] + "..."
+    # normalizar pontuação
+    t = re.sub(r"!{2,}", "!", t)
+    return t
+
 # --------- Seleção final com diversidade e dedupe ---------
 def select_with_caps_and_dedupe(ranked: List[Tuple[float, Dict[str,Any], Dict[str,Any]]], *, max_posts: int, max_share: float) -> List[Tuple[float, Dict[str,Any], Dict[str,Any]]]:
     cap = max(1, int(max_posts * max_share))
@@ -222,14 +250,23 @@ def publish_ranked_ab(pub:TelegramPublisher, db:Storage, ranked:List[Tuple[float
         text_a = ia_item["texto_de_venda_a"] if isinstance(ia_item, dict) else ia_item.texto_de_venda_a
         text_b = ia_item["texto_de_venda_b"] if isinstance(ia_item, dict) else ia_item.texto_de_venda_b
         variant = rnd.choice(["A","B"])
-        texto = text_a if variant=="A" else text_b
+        raw_text = text_a if variant=="A" else text_b
+
+        pname = str(prod.get("productName") or "")
+        cat = tag_categoria(pname)
+        texto = enforce_style(raw_text, pname, cat)
 
         price=float(prod.get("priceMin") or 0.0)
         shop=str(prod.get("shopName") or "")
         rating=prod.get("ratingStar")
         offer=str(prod.get("offerLink") or prod.get("productLink") or "")
+        sales=prod.get("sales")
+        discount_rate=prod.get("priceDiscountRate")
+
         msg=pub.build_message(texto_ia=texto, price=price, shop=shop, offer=offer,
                               rating=float(rating) if rating not in (None,"") else None,
+                              discount_rate=discount_rate,
+                              sales=int(sales) if isinstance(sales,(int,float,str)) and str(sales).isdigit() else None,
                               badge=None, campaign=campaign, sub_id=str(item_id))
         if dry_run:
             logger.info("[DRY RUN][%s] Postaria item %s | score=%.2f | %s", variant, item_id, final_score, offer)

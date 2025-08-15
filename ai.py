@@ -114,16 +114,15 @@ def analyze_products(products: List[Dict[str, Any]], *, model: str = "gemini-1.5
 
     # Regras claras no prompt (penalidades)
     system = (
-        "Você é um curador de ofertas. Retorne SOMENTE JSON válido no schema:\n"
-        "{ \"analise_de_produtos\": [ { \"itemId\": int, \"pontuacao\": 0-100, \"texto_de_venda_a\": str, \"texto_de_venda_b\": str } ] }\n\n"
-        "Critérios:\n"
-        "- Dê notas MAIS ALTAS para: (a) alta reputação (rating>=4.6), (b) desconto real alto, (c) utilidade clara comprovada, (d) preço competitivo na categoria.\n"
-        "- Dê notas BAIXAS (<=40) para produtos com promessas suspeitas ou termos problemáticos: PMPO, 4K barato/\"4K suporte\" em projetor genérico, i12/iXX TWS clone,\n"
-        "  'câmera espiã'/'espi', 'ChatGPT' em smartwatch barato, claims exagerados de potência. Se possível, reflita isso na nota.\n\n"
-        "Texto de venda (A e B):\n"
-        "- Duas variações curtas (até 160 caracteres), sem emojis, sem links e sem promessas não verificáveis.\n"
-        "- A: foco em benefício/uso; B: foco em prova social (rating/vendas) ou urgência leve.\n"
-    )
+        "Você é um copywriter de ofertas. Responda SOMENTE em JSON:\n"
+        '{ "analise_de_produtos": [ { "itemId": int, "pontuacao": 0-100, '
+        '"texto_de_venda_a": str, "texto_de_venda_b": str } ] }\n'
+        "Regras de copy:\n"
+        "- MENCIONE o nome do produto exatamente como recebido (ou a categoria se o nome for muito genérico).\n"
+        "- NÃO cite preço, %OFF, rating, nem nº de vendas.\n"
+        "- 100–160 caracteres. Sem emojis. 1 benefício central + CTA curta (‘Aproveite’, ‘Ver oferta’, ‘Com desconto’ etc.).\n"
+        "Gere duas variações (A foco em benefício; B em urgência leve)."
+      )
     user = f"Produtos:\n{json.dumps(compact, ensure_ascii=False)}\nRetorne SOMENTE JSON (sem texto fora do JSON)."
     prompt = f"{system}\n\n{user}"
     raw = call_gemini(prompt, model=model, api_key=api_key)
