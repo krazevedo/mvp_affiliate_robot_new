@@ -29,11 +29,11 @@ on:
       MIN_DISCOUNT:
         description: "Desconto mínimo (0.15 = 15%)"
         type: number
-        default: 0.15
+        default: 0.30
       MIN_IA_SCORE:
         description: "Score mínimo da IA"
         type: number
-        default: 65
+        default: 75
       MAX_CATEGORY_SHARE:
         description: "Limite de % por categoria (0.4 = 40%)"
         type: number
