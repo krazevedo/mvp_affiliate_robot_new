@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-shopee_bot.py — coleta ofertas via Shopee Affiliate GraphQL, ranqueia com IA + EV,
-aplica guardrails de copy, dedupe por categoria e publica no Telegram com A/B.
-
-Melhorias implementadas:
-- Filtros por categoria: MIN_SALES e MIN_DISCOUNT dinâmicos via env.
-- Prova de preço: "Abaixo do preço mediano de 30 dias" quando detectado no histórico.
-- Formatação padronizada (título em negrito, corpo claro, rodapé, CTA única).
-- A/B controlado por categoria com exploração (%).
-- Telemetria gravada em tabela própria (post_telemetry).
-- Limite de chamadas à IA (IA_TOP_K) e fallback heurístico para quota 429.
-"""
-
 from __future__ import annotations
 
 import os, sys, time, json, logging, hashlib, random, re, sqlite3
@@ -21,22 +8,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-from ai import analyze_products, IAResponse
+from ai import analyze_products, IAResponse, IAItem
 from shopee_monorepo_modules.publisher import TelegramPublisher
 from shopee_monorepo_modules.ev_signal import compute_ev_signal
 from storage import Storage
 
-# ===== logging =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("shopee_bot")
 
-# ===== Config API Shopee =====
 AFFILIATE_ENDPOINT = "https://open-api.affiliate.shopee.com.br/graphql"
 DEFAULT_CONNECT_TIMEOUT = 8
 DEFAULT_READ_TIMEOUT = 20
-USER_AGENT = "OfferBot/2.0 (+https://github.com/yourrepo)"
+USER_AGENT = "OfferBot/1.6 (+https://github.com/yourrepo)"
 
 def make_session() -> requests.Session:
     s = requests.Session()
@@ -78,7 +63,6 @@ def getenv_bool(name: str, default: bool = False) -> bool:
 
 # ===== categorização & normalização =====
 CATS = [
-    ("fone/earbud/headset", r"\bfone\b|\bearpod|\bheadset|\bairpods|\bbluetooth\b|\btws\b"),
     ("mouse/teclado/periféricos", r"\bmouse\b|\bteclado\b|\bmousepad\b|\bkit gamer"),
     ("smartwatch/wearables", r"\bsmartwatch|\bwatch\b|\bmicrowear\b|\bw\d{2}\b|\bs8\b|\bseries\b"),
     ("caixa de som/speaker", r"\bcaixa\b|\bsom\b|\bspeaker\b|xtrad|inova"),
@@ -96,6 +80,8 @@ def tag_categoria(name: str) -> str:
             return cat
     return "outros"
 
+GENERIC_TOKENS = {"gamer","bluetooth","original","usb","com fio","sem fio","led","rgb","headset","fone","mouse","teclado"}
+
 def norm_name(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
@@ -104,33 +90,40 @@ def norm_name(s: str) -> str:
         s = s.replace(tok, "")
     return s
 
-# ===== thresholds por categoria =====
-def parse_map_env(env_name: str) -> Dict[str, float]:
-    raw = os.getenv(env_name, "").strip()
-    out: Dict[str, float] = {}
-    if not raw:
-        return out
-    for part in raw.split(","):
-        if ":" not in part:
-            continue
-        k, v = part.split(":", 1)
-        k = k.strip().lower()
+def extract_brand(name: str) -> Optional[str]:
+    # heurística simples: primeira palavra com inicial maiúscula que não é genérica
+    for tok in re.findall(r"[A-ZÁÂÃÉÊÍÓÔÕÚÇ][\w\-]{2,}", name or ""):
+        tl = tok.lower()
+        if tl not in GENERIC_TOKENS and not tl.isdigit():
+            return tok
+    # fallback: última palavra
+    parts = (name or "").split()
+    return parts[-1] if parts else None
+
+def extract_dpi(name: str) -> Optional[int]:
+    m = re.search(r"(\d{3,5})\s*DPI", name or "", re.IGNORECASE)
+    if m:
         try:
-            out[k] = float(v.strip())
+            return int(m.group(1))
         except Exception:
-            continue
-    return out
+            return None
+    return None
 
-MIN_SALES_DEFAULT = getenv_int("MIN_SALES_DEFAULT", 100)
-MIN_SALES_BY_CAT = {k: int(v) for k, v in parse_map_env("MIN_SALES_BY_CAT").items()}  # ex: "cozinha:80,gamer:50"
-MIN_DISCOUNT_DEFAULT = getenv_float("MIN_DISCOUNT", 0.15)
-MIN_DISCOUNT_BY_CAT = parse_map_env("MIN_DISCOUNT_BY_CAT")  # ex: "gadgets:0.2,cozinha:0.15,audio:0.1"
+def extract_buttons(name: str) -> Optional[int]:
+    m = re.search(r"(\d+)\s*bot", name or "", re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
 
-def get_min_sales(cat: str) -> int:
-    return int(MIN_SALES_BY_CAT.get(cat.lower(), MIN_SALES_DEFAULT))
-
-def get_min_discount(cat: str) -> float:
-    return float(MIN_DISCOUNT_BY_CAT.get(cat.lower(), MIN_DISCOUNT_DEFAULT))
+def make_signature_key(name: str) -> Optional[Tuple[str, Optional[str], Optional[int], Optional[int]]]:
+    cat = tag_categoria(name)
+    brand = extract_brand(name or "")
+    dpi = extract_dpi(name or "")
+    btn = extract_buttons(name or "")
+    return (cat, brand, dpi, btn)
 
 # ===== Assinatura Shopee (GraphQL) =====
 def _build_auth_header(partner_id: int, api_key: str, payload_str: str, ts: Optional[int] = None) -> Tuple[str, int]:
@@ -139,7 +132,15 @@ def _build_auth_header(partner_id: int, api_key: str, payload_str: str, ts: Opti
     signature = hashlib.sha256(base_string.encode("utf-8")).hexdigest()
     return f"SHA256 Credential={partner_id}, Timestamp={timestamp}, Signature={signature}", timestamp
 
-def graphql_product_offer_v2(partner_id: int, api_key: str, *, keyword: Optional[str] = None, shop_id: Optional[int] = None, limit: int = 15, page: int = 1) -> Dict[str, Any]:
+def graphql_product_offer_v2(
+    partner_id: int,
+    api_key: str,
+    *,
+    keyword: Optional[str] = None,
+    shop_id: Optional[int] = None,
+    limit: int = 15,
+    page: int = 1,
+) -> Dict[str, Any]:
     assert (keyword is not None) ^ (shop_id is not None), "Forneça keyword OU shop_id"
     params = f'keyword: "{keyword}"' if keyword is not None else f"shopId: {int(shop_id)}"
     query = (
@@ -151,7 +152,12 @@ def graphql_product_offer_v2(partner_id: int, api_key: str, *, keyword: Optional
     payload = json.dumps(body, separators=(",", ":"))
     auth, _ = _build_auth_header(partner_id, api_key, payload)
     headers = {"Authorization": auth, "Content-Type": "application/json"}
-    r = SESSION.post(AFFILIATE_ENDPOINT, data=payload, headers=headers, timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT))
+    r = SESSION.post(
+        AFFILIATE_ENDPOINT,
+        data=payload,
+        headers=headers,
+        timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT),
+    )
     r.raise_for_status()
     return r.json()
 
@@ -159,18 +165,19 @@ def verificar_link_ativo(url: str) -> bool:
     if not url:
         return False
     try:
-        r = SESSION.head(url, allow_redirects=True, timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT), headers={"User-Agent": USER_AGENT})
+        r = SESSION.head(url, allow_redirects=True, timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT),
+                         headers={"User-Agent": USER_AGENT})
         if 200 <= r.status_code < 400:
             return True
     except Exception:
         pass
     try:
-        r = SESSION.get(url, allow_redirects=True, timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT), headers={"User-Agent": USER_AGENT})
+        r = SESSION.get(url, allow_redirects=True, timeout=(DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT),
+                        headers={"User-Agent": USER_AGENT})
         return (200 <= r.status_code < 400) and ("O produto não existe" not in (r.text or ""))
     except Exception:
         return False
 
-# ===== Coleta, blocklist e filtros =====
 def carregar_keywords(path: str = "keywords.txt") -> List[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -206,7 +213,15 @@ def is_blocked(name: str, patterns: List[re.Pattern]) -> bool:
         return False
     return any(p.search(name) for p in patterns)
 
-def coletar_ofertas(partner_id: int, api_key: str, *, keywords: List[str], shop_ids: List[int], paginas: int, itens_por_pagina: int) -> List[Dict[str, Any]]:
+def coletar_ofertas(
+    partner_id: int,
+    api_key: str,
+    *,
+    keywords: List[str],
+    shop_ids: List[int],
+    paginas: int,
+    itens_por_pagina: int,
+) -> List[Dict[str, Any]]:
     ofertas: List[Dict[str, Any]] = []
     fontes = [{"tipo": "keyword", "valor": kw} for kw in keywords] + [{"tipo": "shopId", "valor": sid} for sid in shop_ids]
     bl = get_blocklist_patterns()
@@ -248,12 +263,12 @@ def coletar_ofertas(partner_id: int, api_key: str, *, keywords: List[str], shop_
                 ofertas.append(
                     {
                         "itemId": iid,
-                        "productName": name,
+                        "productName": name.strip(),
                         "priceMin": p.get("priceMin"),
                         "priceMax": p.get("priceMax"),
                         "offerLink": p.get("offerLink"),
                         "productLink": p.get("productLink"),
-                        "shopName": p.get("shopName"),
+                        "shopName": (p.get("shopName") or "").strip(),
                         "ratingStar": p.get("ratingStar"),
                         "sales": p.get("sales"),
                         "priceDiscountRate": p.get("priceDiscountRate"),
@@ -264,7 +279,58 @@ def coletar_ofertas(partner_id: int, api_key: str, *, keywords: List[str], shop_
     dedup = {it["itemId"]: it for it in ofertas}
     return list(dedup.values())
 
-# ===== Guardrails de copy =====
+# ===== Filtros por categoria =====
+def parse_map_env(env_name: str) -> Dict[str, float]:
+    raw = os.getenv(env_name, "").strip()
+    result: Dict[str, float] = {}
+    if not raw:
+        return result
+    for part in raw.split(","):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        k = k.strip().lower()
+        try:
+            result[k] = float(v)
+        except Exception:
+            continue
+    return result
+
+def filter_quality_by_category(products: List[Dict[str, Any]], *, min_rating: float) -> List[Dict[str, Any]]:
+    default_min_sales = getenv_int("MIN_SALES_DEFAULT", 100)
+    min_sales_map = parse_map_env("MIN_SALES_BY_CAT")
+    default_min_disc = getenv_float("MIN_DISCOUNT", 0.15)
+    min_disc_map = parse_map_env("MIN_DISCOUNT_BY_CAT")
+
+    out: List[Dict[str, Any]] = []
+    for p in products:
+        name = p.get("productName") or ""
+        cat = tag_categoria(name)
+        try:
+            rating = float(p.get("ratingStar") or 0.0)
+        except Exception:
+            rating = 0.0
+        try:
+            disc = float(p.get("priceDiscountRate") or 0.0)
+        except Exception:
+            disc = 0.0
+        sales_val = p.get("sales")
+        sales = int(sales_val) if (isinstance(sales_val, (int, float)) or (isinstance(sales_val, str) and sales_val.isdigit())) else 0
+
+        cat_key = cat.lower()
+        min_sales = int(min_sales_map.get(cat_key, default_min_sales))
+        min_disc = float(min_disc_map.get(cat_key, default_min_disc))
+
+        # exceção leve para categorias com oferta escassa
+        min_rating_eff = min_rating
+        if cat_key in ("câmera/segurança", "projetor"):
+            min_rating_eff = max(4.6, min_rating - 0.1)
+
+        if rating >= min_rating_eff and disc >= min_disc and sales >= min_sales:
+            out.append(p)
+    return out
+
+# ===== Guardrails / Heurísticas =====
 PRICE_PAT = re.compile(r"(r\$\s?\d+[\.,]?\d*)|(%\s?off)", re.IGNORECASE)
 STAR_PAT = re.compile(r"(\d[\.,]?\d\s*estrelas?)|(avalia[cç][aã]o\s*\d[\.,]?\d)", re.IGNORECASE)
 SALES_PAT = re.compile(r"(\d+\+?\s*vendas?)", re.IGNORECASE)
@@ -277,7 +343,7 @@ SPEC_PATTERNS = [
     (re.compile(r"\b(\d+)\s*l\b", re.IGNORECASE), lambda m: f"{m.group(1)}L"),
     (re.compile(r"\b360\b"), lambda m: "rotação 360°"),
     (re.compile(r"\bbluetooth\b", re.IGNORECASE), lambda m: "Bluetooth"),
-    (re.compile(r"\banc\b|\bnoise\b", re.IGNORECASE), lambda m: "cancelamento de ruído"),
+    (re.compile(r"\bcetim\b", re.IGNORECASE), lambda m: "cetim anti-frizz"),
 ]
 
 def derive_hint(name: str) -> Optional[str]:
@@ -290,6 +356,13 @@ def derive_hint(name: str) -> Optional[str]:
             except Exception:
                 continue
     return None
+
+GENERIC_PHRASES = [
+    "com ótimo custo-benefício no dia a dia",
+    "praticidade para sua rotina",
+    "conforto e qualidade no uso diário",
+    "funcional e versátil para diferentes usos",
+]
 
 def sanitize_copy(text: str) -> str:
     t = text or ""
@@ -304,21 +377,27 @@ def sanitize_copy(text: str) -> str:
 def enforce_style(text: str, product_name: str, category: str, hint: Optional[str] = None) -> str:
     t = sanitize_copy(text)
     pn = (product_name or "").strip()
-    if pn and pn[:8].lower() not in t.lower() and (category or "").lower() not in t.lower():
-        t = f"{pn}: {t}"
-    if hint and hint.lower() not in t.lower() and len(t) < 120:
+    # evita duplicar o título no corpo
+    if pn and t.lower().startswith(pn.lower()):
+        t = t[len(pn):].lstrip(": ").lstrip("- ").strip()
+
+    # se ficou curto/sem benefício, injeta uma frase genérica variada
+    if len(t) < 40:
+        from random import choice
+        t = f"{pn}: {choice(GENERIC_PHRASES)}." if pn else f"{choice(GENERIC_PHRASES)}."
+
+    if hint and hint.lower() not in t.lower() and len(t) < 140:
         if ": " in t[:60]:
             t = t.replace(": ", f": {hint} — ", 1)
         else:
             t = f"{t} — {hint}"
-    if not URGENCY_TAIL.search(t) and len(t) < 90:
+    if not URGENCY_TAIL.search(t) and len(t) < 120:
         t = (t + " Aproveite.").strip()
     if len(t) > 170:
         t = t[:165].rsplit(" ", 1)[0] + "..."
     t = re.sub(r"!{2,}", "!", t)
     return t
 
-# ===== IA e heurística =====
 def heuristic_score(prod: Dict[str, Any], db_path: str) -> float:
     try:
         disc = float(prod.get("priceDiscountRate") or 0.0)
@@ -329,7 +408,12 @@ def heuristic_score(prod: Dict[str, Any], db_path: str) -> float:
     except Exception:
         rating = 0.0
     rating_n = max(0.0, min(1.0, (rating - 4.5) / 0.5))  # 4.5->0, 5.0->1
-    ev = compute_ev_signal(db_path, item_id=int(prod.get("itemId") or 0), product_name=prod.get("productName", ""), shop_name=prod.get("shopName"))
+    ev = compute_ev_signal(
+        db_path,
+        item_id=int(prod.get("itemId") or 0),
+        product_name=prod.get("productName", ""),
+        shop_name=prod.get("shopName"),
+    )
     return 0.45 * disc + 0.35 * rating_n + 0.20 * ev
 
 def heuristic_copies(prod: Dict[str, Any]) -> Dict[str, Any]:
@@ -339,73 +423,78 @@ def heuristic_copies(prod: Dict[str, Any]) -> Dict[str, Any]:
     base = f"{name}"
     if hint:
         base += f": {hint}"
-    a = enforce_style(f"{base} para o dia a dia com ótimo custo-benefício.", name, cat, hint=hint)
-    b = enforce_style(f"{base} ideal para quem busca praticidade no uso diário.", name, cat, hint=hint)
-    return {"texto_de_venda_a": a, "texto_de_venda_b": b}
+    # frases mais específicas por categoria
+    if "cetin" in name.lower() or "touca" in name.lower() or "gorro" in name.lower():
+        a = f"Reduz frizz e preserva a hidratação dos fios durante a noite."
+        b = f"Conforto na hora de dormir com proteção anti-frizz para acordar com menos volume."
+    elif cat == "mouse/teclado/periféricos":
+        a = f"Precisão e resposta para elevar seu jogo — 6 botões e {hint or 'design ergonômico'}."
+        b = f"Controle rápido com {hint or 'sensor ajustável'} e iluminação para sua setup."
+    elif cat == "caixa de som/speaker":
+        a = f"Som equilibrado para músicas e vídeos, com {hint or 'graves reforçados'}."
+        b = f"Portátil e prático, ideal para levar o som a qualquer ambiente."
+    else:
+        a = f"Praticidade diária com {hint or 'bom acabamento'}."
+        b = f"Funcional para diferentes usos no dia a dia."
+    a = enforce_style(a, name, cat, hint=hint)
+    b = enforce_style(b, name, cat, hint=hint)
+    return {
+        "texto_de_venda_a": a,
+        "texto_de_venda_b": b,
+    }
 
-# ===== preço mediano 30d =====
-def _detect_price_table(con) -> Optional[Tuple[str, str, str]]:
-    # retorna (table, item_col, price_col, time_col) — time_col epoch ou ISO8601
-    cur = con.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = [r[0] for r in cur.fetchall()]
-    item_candidates = ["item_id", "itemId", "product_id"]
-    price_candidates = ["price", "priceMin", "price_min"]
-    time_candidates = ["timestamp", "ts", "created_at", "time", "dt", "posted_at"]
-    for t in tables:
-        try:
-            cur.execute(f"PRAGMA table_info({t})")
-            cols = [r[1] for r in cur.fetchall()]
-            item_col = next((c for c in item_candidates if c in cols), None)
-            price_col = next((c for c in price_candidates if c in cols), None)
-            time_col = next((c for c in time_candidates if c in cols), None)
-            if item_col and price_col and time_col:
-                return (t, item_col, price_col, time_col)
-        except Exception:
-            continue
-    return None
+# ===== Deduplicação por assinatura =====
+def dedupe_by_signature(candidates: List[Dict[str, Any]], db_path: str) -> List[Dict[str, Any]]:
+    scored = [(heuristic_score(p, db_path), p) for p in candidates]
+    buckets: Dict[Tuple, Tuple[float, Dict[str, Any]]] = {}
+    for score, p in scored:
+        key = make_signature_key(p.get("productName") or "")
+        if key not in buckets or score > buckets[key][0]:
+            buckets[key] = (score, p)
+    return [p for _, p in buckets.values()]
 
-def is_below_30d_median(db_path: str, item_id: int, current_price: float) -> bool:
+# ===== preço mediano 30 dias =====
+def below_median_30d(db_path: str, item_id: int, current_price: Optional[float]) -> bool:
+    if not db_path or not os.path.exists(db_path) or current_price in (None, 0):
+        return False
     try:
         con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        now = int(time.time())
+        since = now - 30*24*3600
+        # tentativas de tabelas/colunas conhecidas
+        candidates = [
+            ("price_points", "price", "ts"),
+            ("price_history", "price", "ts"),
+            ("historico_precos", "preco", "timestamp"),
+        ]
+        prices = []
+        for table, col_price, col_ts in candidates:
+            try:
+                cur.execute(f"SELECT {col_price} FROM {table} WHERE item_id=? AND {col_ts}>=? ORDER BY {col_ts} DESC", (item_id, since))
+                rows = cur.fetchall()
+                if rows:
+                    prices = [float(r[0]) for r in rows if r[0] is not None]
+                    break
+            except Exception:
+                continue
+        con.close()
+        if len(prices) < 4:
+            return False
+        prices.sort()
+        mid = (len(prices)-1)//2
+        if len(prices) % 2 == 1:
+            median = prices[mid]
+        else:
+            median = 0.5*(prices[mid] + prices[mid+1])
+        return current_price <= median*0.98
     except Exception:
         return False
-    try:
-        det = _detect_price_table(con)
-        if not det:
-            return False
-        t, item_col, price_col, time_col = det
-        # Seleciona últimos 30 dias (tanto epoch quanto texto)
-        q = f"""
-        SELECT {price_col}
-        FROM {t}
-        WHERE {item_col}=?
-          AND (
-            (typeof({time_col})='integer' AND {time_col} >= strftime('%s','now','-30 day'))
-            OR
-            (typeof({time_col})!='integer' AND datetime({time_col}) >= datetime('now','-30 day'))
-          )
-        ORDER BY {time_col} DESC
-        """
-        cur = con.cursor()
-        cur.execute(q, (item_id,))
-        prices = [float(r[0]) for r in cur.fetchall() if r[0] is not None]
-        if len(prices) < 5:
-            return False
-        prices_sorted = sorted(prices)
-        n = len(prices_sorted)
-        if n % 2 == 1:
-            median = prices_sorted[n//2]
-        else:
-            median = 0.5*(prices_sorted[n//2 - 1] + prices_sorted[n//2])
-        return (float(current_price) or 0.0) < median * 0.98  # 2% abaixo do mediano
-    except Exception as e:
-        return False
-    finally:
-        con.close()
 
 # ===== Seleção final =====
-def select_with_caps_and_dedupe(ranked: List[Tuple[float, Dict[str, Any], Dict[str, Any]]], *, max_posts: int, max_share: float) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
+def select_with_caps_and_dedupe(
+    ranked: List[Tuple[float, Dict[str, Any], Dict[str, Any]]], *, max_posts: int, max_share: float
+) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     cap = max(1, int(max_posts * max_share))
     chosen: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     cat_counts: Dict[str, int] = {}
@@ -425,65 +514,43 @@ def select_with_caps_and_dedupe(ranked: List[Tuple[float, Dict[str, Any], Dict[s
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
     return chosen
 
-# ===== A/B controlado por categoria =====
+# ===== A/B por categoria =====
 def parse_variant_map(env_name: str) -> Dict[str, str]:
     raw = os.getenv(env_name, "").strip()
-    out: Dict[str, str] = {}
+    result: Dict[str, str] = {}
     if not raw:
-        return out
+        return result
     for part in raw.split(","):
         if ":" not in part:
             continue
         k, v = part.split(":", 1)
-        out[k.strip().lower()] = v.strip().upper()[:1] if v.strip() else "A"
-    return out
+        k = k.strip().lower()
+        result[k] = v.strip().upper()[:1] or "A"
+    return result
 
-AB_DEFAULT_VARIANT_BY_CAT = parse_variant_map("AB_DEFAULT_VARIANT_BY_CAT")  # ex: "cozinha:A,gamer:B"
-AB_EXPLORE_PCT = max(0.0, min(1.0, float(os.getenv("AB_EXPLORE_PCT", "0.3"))))
-
-def choose_variant_for_category(cat: str, rng: random.Random) -> str:
-    # Explora com probabilidade AB_EXPLORE_PCT; caso contrário usa padrão do mapa (default A)
-    if rng.random() < AB_EXPLORE_PCT:
-        return rng.choice(["A", "B"])
-    return AB_DEFAULT_VARIANT_BY_CAT.get(cat.lower(), "A")
-
-def count_emojis(s: str) -> int:
-    # Contagem simples de emojis (faixas comuns)
-    if not s:
-        return 0
-    return len(re.findall(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U00002600-\U000026FF]", s))
-
-def record_post_telemetry(db_path: str, *, message_id: str, item_id: int, category: str, copy_len: int, cta_used: str, emoji_used: int, below_median_30d: bool, variant: str):
-    try:
-        con = sqlite3.connect(db_path)
-        cur = con.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS post_telemetry (
-            message_id TEXT,
-            item_id INTEGER,
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            category TEXT,
-            copy_len INTEGER,
-            cta_used TEXT,
-            emoji_used INTEGER,
-            below_median_30d INTEGER,
-            variant TEXT
-        )
-        """)
-        cur.execute("""
-        INSERT INTO post_telemetry (message_id, item_id, category, copy_len, cta_used, emoji_used, below_median_30d, variant)
-        VALUES (?,?,?,?,?,?,?,?)
-        """, (message_id, item_id, category, copy_len, cta_used, int(bool(below_median_30d)), variant))
-        con.commit()
-        con.close()
-    except Exception as e:
-        logger.warning("Falha ao registrar telemetria: %s", e)
+def pick_variant_for_category(category: str, rnd: random.Random) -> str:
+    default_map = parse_variant_map("AB_DEFAULT_VARIANT_BY_CAT")
+    explore_pct = float(os.getenv("AB_EXPLORE_PCT", "0.3"))
+    cat_key = (category or "outros").lower()
+    base = default_map.get(cat_key, "A").upper()
+    if rnd.random() < explore_pct:
+        return "B" if base == "A" else "A"
+    return base
 
 # ===== Publicação (A/B) =====
-def publish_ranked_ab(pub: TelegramPublisher, db: Storage, ranked: List[Tuple[float, Dict[str, Any], Dict[str, Any]]], *, max_posts: int, cooldown_days: int, dry_run: bool, db_path: str) -> int:
+def publish_ranked_ab(
+    pub: TelegramPublisher,
+    db: Storage,
+    ranked: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    *,
+    max_posts: int,
+    cooldown_days: int,
+    dry_run: bool = False,
+    db_path: str = "data/bot.db",
+) -> int:
     posted = 0
     campaign = time.strftime("%Y%m%d")
-    rng = random.Random()
+    rnd = random.Random()
     for final_score, ia_item, prod in ranked:
         item_id = int(ia_item["itemId"] if isinstance(ia_item, dict) else getattr(ia_item, "itemId", 0) or 0)
         if not item_id:
@@ -496,31 +563,26 @@ def publish_ranked_ab(pub: TelegramPublisher, db: Storage, ranked: List[Tuple[fl
         cat = tag_categoria(pname)
         hint = derive_hint(pname)
 
-        # seleciona variante com exploração controlada
-        variant = choose_variant_for_category(cat, rng)
-
         text_a = ia_item["texto_de_venda_a"] if isinstance(ia_item, dict) else ia_item.texto_de_venda_a
         text_b = ia_item["texto_de_venda_b"] if isinstance(ia_item, dict) else ia_item.texto_de_venda_b
-        raw_text = text_a if variant == "A" else text_b
 
+        variant = pick_variant_for_category(cat, rnd)
+        raw_text = text_a if variant == "A" else text_b
         texto = enforce_style(raw_text, pname, cat, hint=hint)
 
-        # Rodapé e flags
+        # Campos para rodapé e link
         try:
             price = float(prod.get("priceMin") or 0.0)
         except Exception:
             price = 0.0
-        shop = str(prod.get("shopName") or "")
+        shop = str(prod.get("shopName") or "").strip()
         rating = prod.get("ratingStar")
         offer = str(prod.get("offerLink") or prod.get("productLink") or "")
         sales = prod.get("sales")
         discount_rate = prod.get("priceDiscountRate")
 
-        below_med = is_below_30d_median(db_path, item_id, price)
-        high_trust = (isinstance(rating, (int, float)) and float(rating) >= 4.8) and (isinstance(sales, int) and sales >= 100)
-
         sub_id = f"{item_id}-{variant}-{time.strftime('%Y%m%d')}"
-        cta_text = "🔗 Ver oferta" if variant == "A" else "🔗 Abrir no app"
+        is_below_median = below_median_30d(db_path, item_id, price)
 
         msg = pub.build_message(
             product_name=pname,
@@ -529,29 +591,53 @@ def publish_ranked_ab(pub: TelegramPublisher, db: Storage, ranked: List[Tuple[fl
             shop=shop,
             offer=offer,
             rating=float(rating) if rating not in (None, "") else None,
-            discount_rate=float(discount_rate) if discount_rate not in (None, "") else None,
+            discount_rate=discount_rate,
             sales=int(sales) if isinstance(sales, (int, float, str)) and str(sales).isdigit() else None,
             badge=None,
             campaign=campaign,
             sub_id=sub_id,
-            cta_text=cta_text,
-            below_median_30d=below_med,
-            high_trust=high_trust,
+            category=cat,
+            below_median_30d=is_below_median,
+            cta_variant=variant,
         )
-
         if dry_run:
             logger.info("[DRY RUN][%s] Postaria item %s | score=%.2f | %s", variant, item_id, final_score, offer)
             db.record_post(item_id, variant=variant, message_id=f"dryrun-{int(time.time())}")
-            emoji_ct = count_emojis(msg)
-            record_post_telemetry(db_path, message_id=f"dryrun-{int(time.time())}", item_id=item_id, category=cat, copy_len=len(texto), cta_used=cta_text, emoji_used=emoji_ct, below_median_30d=below_med, variant=variant)
             posted += 1
         else:
             try:
                 mid = pub.send_message(msg)
                 if mid:
+                    # telemetria leve
+                    try:
+                        con = sqlite3.connect(db_path)
+                        cur = con.cursor()
+                        cur.execute("""
+                        CREATE TABLE IF NOT EXISTS post_telemetry (
+                          message_id TEXT PRIMARY KEY,
+                          item_id INTEGER,
+                          category TEXT,
+                          variant TEXT,
+                          copy_len INTEGER,
+                          cta_used TEXT,
+                          emoji_used TEXT,
+                          below_median_30d INTEGER,
+                          created_at INTEGER
+                        )
+                        """)
+                        emoji = pub.EMOJI_BY_CAT[cat] if hasattr(pub, "EMOJI_BY_CAT") and cat in getattr(pub, "EMOJI_BY_CAT") else ""
+                        cta_used = "Ver oferta" if variant=="A" else "Abrir no app"
+                        cur.execute("""
+                            INSERT OR REPLACE INTO post_telemetry
+                            (message_id,item_id,category,variant,copy_len,cta_used,emoji_used,below_median_30d,created_at)
+                            VALUES (?,?,?,?,?,?,?,?,?)
+                        """, (str(mid), item_id, cat, variant, len(texto), cta_used, emoji, 1 if is_below_median else 0, int(time.time())))
+                        con.commit()
+                        con.close()
+                    except Exception as _e:
+                        logger.debug("Falha telemetria: %s", _e)
+
                     db.record_post(item_id, variant=variant, message_id=str(mid))
-                    emoji_ct = count_emojis(msg)
-                    record_post_telemetry(db_path, message_id=str(mid), item_id=item_id, category=cat, copy_len=len(texto), cta_used=cta_text, emoji_used=emoji_ct, below_median_30d=below_med, variant=variant)
                     posted += 1
                     logger.info("Publicado [%s] item %s | score=%.2f | message_id=%s", variant, item_id, final_score, mid)
                 else:
@@ -562,36 +648,11 @@ def publish_ranked_ab(pub: TelegramPublisher, db: Storage, ranked: List[Tuple[fl
             break
     return posted
 
-# ===== Filtro candidatos com mínimos por categoria =====
-def filter_candidates(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for p in products:
-        name = p.get("productName") or ""
-        cat = tag_categoria(name)
-        min_sales = get_min_sales(cat)
-        min_disc = get_min_discount(cat)
-        try:
-            rating = float(p.get("ratingStar") or 0.0)
-        except Exception:
-            rating = 0.0
-        try:
-            disc = float(p.get("priceDiscountRate") or 0.0)
-        except Exception:
-            disc = 0.0
-        try:
-            sales = int(p.get("sales") or 0)
-        except Exception:
-            sales = 0
-        min_rating = float(os.getenv("MIN_RATING", "4.7"))
-        if rating >= min_rating and disc >= min_disc and sales >= min_sales:
-            out.append(p)
-    return out
-
 # ===== Main =====
 def main():
     PARTNER_ID_STR = getenv_required("SHOPEE_PARTNER_ID")
     API_KEY = getenv_required("SHOPEE_API_KEY")
-    _ = getenv_required("GEMINI_API_KEY")  # ainda exigimos; se IA_ENABLED=0, não será usada
+    _ = getenv_required("GEMINI_API_KEY")  # exige esta VAR (mesmo se IA_ENABLED=0)
     TELEGRAM_BOT_TOKEN = getenv_required("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = getenv_required("TELEGRAM_CHAT_ID")
     try:
@@ -599,9 +660,10 @@ def main():
     except Exception:
         sys.exit("ERRO: SHOPEE_PARTNER_ID inválido (não numérico).")
 
-    QTD_POSTS = getenv_int("QUANTIDADE_DE_POSTS_POR_EXECUCAO", 3)
+    QTD_POSTS = getenv_int("QUANTIDADE_DE_POSTS_POR_EXECUCAO", 4)
     PAGINAS = getenv_int("PAGINAS_A_VERIFICAR", 2)
     ITENS_POR_PAGINA = getenv_int("ITENS_POR_PAGINA", 15)
+    MIN_RATING = getenv_float("MIN_RATING", 4.7)
     MIN_IA_SCORE = getenv_float("MIN_IA_SCORE", 65.0)
     COOLDOWN_DIAS = getenv_int("COOLDOWN_REPOSTAGEM_DIAS", 5)
     DRY_RUN = getenv_bool("DRY_RUN", False)
@@ -619,10 +681,13 @@ def main():
     pub = TelegramPublisher(bot_token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID)
 
     logger.info("Coletando ofertas (GraphQL Affiliate)...")
-    gross = coletar_ofertas(PARTNER_ID, API_KEY, keywords=keywords, shop_ids=shop_ids, paginas=PAGINAS, itens_por_pagina=ITENS_POR_PAGINA)
+    gross = coletar_ofertas(
+        PARTNER_ID, API_KEY,
+        keywords=keywords, shop_ids=shop_ids,
+        paginas=PAGINAS, itens_por_pagina=ITENS_POR_PAGINA,
+    )
     logger.info("Coleta bruta: %d ofertas", len(gross))
 
-    # Persistência (preço/histórico)
     for p in gross:
         try:
             db.upsert_product(
@@ -643,11 +708,16 @@ def main():
         except Exception as e:
             logger.warning("Falha ao persistir item %s: %s", p.get("itemId"), e)
 
-    candidates = filter_candidates(gross)
-    logger.info("Candidatos após filtros dinâmicos: %d", len(candidates))
+    # Filtro de qualidade por categoria
+    candidates = filter_quality_by_category(gross, min_rating=MIN_RATING)
+    logger.info("Candidatos após filtros de qualidade: %d", len(candidates))
     if not candidates:
         logger.warning("Sem candidatos após filtros. Encerrando.")
         return 0
+
+    # Deduplicação por assinatura (evita 2x mesmo mouse 2400DPI/6 botões da mesma marca)
+    candidates = dedupe_by_signature(candidates, DB_PATH)
+    logger.info("Após dedupe por assinatura: %d", len(candidates))
 
     # ===== IA quota-safe =====
     ia_results: List[Dict[str, Any]] = []
@@ -662,13 +732,15 @@ def main():
                 resp: IAResponse = analyze_products(batch)
                 ia_results.extend([x.model_dump() for x in resp.analise_de_produtos])
             except Exception as e:
-                logger.warning("IA indisponível para o lote %s — heurística (%s itens). Erro: %s", (i // IA_BATCH_SIZE) + 1, len(batch), e)
+                logger.warning("IA indisponível para o lote %s — usando heurística (%s itens). Erro: %s", (i // IA_BATCH_SIZE) + 1, len(batch), e)
                 for p in batch:
                     iid = int(p["itemId"])
                     h = heuristic_copies(p)
                     pre = next((s for s, pp in prelim if pp is p), 0.4)
                     score = int(55 + (82 - 55) * max(0.0, min(1.0, pre)))
-                    ia_results.append({"itemId": iid, "pontuacao": score, "texto_de_venda_a": h["texto_de_venda_a"], "texto_de_venda_b": h["texto_de_venda_b"]})
+                    ia_results.append({"itemId": iid, "pontuacao": score,
+                                       "texto_de_venda_a": h["texto_de_venda_a"],
+                                       "texto_de_venda_b": h["texto_de_venda_b"]})
 
     remaining = [p for p in candidates if p not in top_for_ia]
     for p in remaining:
@@ -676,7 +748,9 @@ def main():
         h = heuristic_copies(p)
         pre = heuristic_score(p, DB_PATH)
         score = int(58 + (78 - 58) * max(0.0, min(1.0, pre)))
-        ia_results.append({"itemId": iid, "pontuacao": score, "texto_de_venda_a": h["texto_de_venda_a"], "texto_de_venda_b": h["texto_de_venda_b"]})
+        ia_results.append({"itemId": iid, "pontuacao": score,
+                           "texto_de_venda_a": h["texto_de_venda_a"],
+                           "texto_de_venda_b": h["texto_de_venda_b"]})
 
     ia_by_id = {int(x["itemId"]): x for x in ia_results if str(x.get("itemId", "")).isdigit()}
 
@@ -697,10 +771,10 @@ def main():
         ranked.append((final, ia, p))
     ranked.sort(key=lambda x: x[0], reverse=True)
 
-    selected = select_with_caps_and_dedupe(ranked, max_posts=QTD_POSTS, max_share=float(os.getenv("MAX_CATEGORY_SHARE", "0.5")))
+    selected = select_with_caps_and_dedupe(ranked, max_posts=QTD_POSTS, max_share=MAX_CATEGORY_SHARE)
     logger.info("Selecionados (após caps/dedupe): %d", len(selected))
 
-    posted = publish_ranked_ab(pub, db, selected, max_posts=QTD_POSTS, cooldown_days=getenv_int("COOLDOWN_REPOSTAGEM_DIAS", 5), dry_run=getenv_bool("DRY_RUN", False), db_path=DB_PATH)
+    posted = publish_ranked_ab(pub, db, selected, max_posts=QTD_POSTS, cooldown_days=COOLDOWN_DIAS, dry_run=DRY_RUN, db_path=DB_PATH)
     logger.info("Publicações concluídas: %d", posted)
     return posted
 

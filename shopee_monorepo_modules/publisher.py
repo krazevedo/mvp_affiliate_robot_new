@@ -1,60 +1,90 @@
-import os
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import html
 import re
 from typing import Optional
 
-def _fmt_price(v) -> str:
-    try:
-        f = float(v)
-        return f"R$ {f:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
+EMOJI_BY_CAT = {
+    "mouse/teclado/periféricos": "🖱️",
+    "smartwatch/wearables": "⌚",
+    "caixa de som/speaker": "🔊",
+    "projetor": "📽️",
+    "cozinha (airfryer etc.)": "🍳",
+    "câmera/segurança": "📷",
+    "papelaria": "📝",
+    "outros": "✨",
+}
+
+CTA_LABELS = {
+    "A": "🔗 Ver oferta",
+    "B": "🔗 Abrir no app",
+}
+
+TITLE_PREFIXES_TO_STRIP = [
+    r"super oferta\s*-\s*",
+    r"oferta relâmpago\s*-\s*",
+]
+
+TITLE_NOISE = [
+    "original", "usb", "com fio", "sem fio", "rgb", "led",
+]
+
+def _clean_title(name: str) -> str:
+    t = (name or "").strip()
+    for pat in TITLE_PREFIXES_TO_STRIP:
+        t = re.sub(pat, "", t, flags=re.IGNORECASE)
+    # compactar espaços e capitalização leve (sem gritar)
+    t = re.sub(r"\s{2,}", " ", t)
+    return t.strip()
+
+def _sanitize_body(text: str, product_name: str) -> str:
+    # evita repetir o nome do produto no corpo se já estiver no título
+    t = (text or "").strip()
+    # remove repetições do nome no início
+    pname = (product_name or "").strip()
+    if pname and t.lower().startswith(pname.lower()):
+        t = t[len(pname):].lstrip(": ").lstrip("- ").strip()
+    # tira excesso de espaços e pontuação
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"[.!?]{2,}$", ".", t)
+    # reduz frases genéricas demais
+    t = t.replace("para o dia a dia com ótimo custo-benefício", "com ótimo custo-benefício no dia a dia")
+    return t.strip()
+
+def _format_price_brl(value: float) -> str:
+    if value is None:
         return "-"
+    # formatação PT-BR simples
+    return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+def _reason_now(discount_rate: Optional[float], below_median_30d: bool, sales: Optional[int]) -> Optional[str]:
+    try:
+        disc = float(discount_rate or 0.0)
+    except Exception:
+        disc = 0.0
+    s = int(sales) if (isinstance(sales, (int, float, str)) and str(sales).isdigit()) else 0
 
-def _append_sub_id(url: str, sub_id: Optional[str]) -> str:
-    if not url or not sub_id:
-        return url or ""
-    sep = "&" if "?" in url else "?"
-    # Shopee usa subId ou sub_id dependendo do link. Preferimos subId.
-    if "subId=" in url or "sub_id=" in url:
+    if below_median_30d:
+        return "Preço DESPENCOU"
+    if disc >= 0.40:
+        return "Só hoje."
+    if s >= 1000:
+        return "Está todo mundo comprando."
+    return None
+
+def _append_subid(url: str, sub_id: str) -> str:
+    if not url:
         return url
-    return f"{url}{sep}subId={sub_id}"
-
-
-def _strip_leading_name(body: str, product_name: str) -> str:
-    """Remove o nome no início do corpo se ele já for o título."""
-    if not body:
-        return ""
-    b = body.strip()
-    pn = (product_name or "").strip()
-    if not pn:
-        return b
-    # Se começa com o nome + ":" ou " - " removemos essa parte
-    pattern = re.compile(rf"^\s*{re.escape(pn)}\s*[:\-–—]\s*", re.IGNORECASE)
-    b = pattern.sub("", b, count=1)
-    return b.strip()
-
+    sep = "&" if "?" in url else "?"
+    if "sub_id=" in url:
+        return url
+    return f"{url}{sep}sub_id={sub_id}"
 
 class TelegramPublisher:
-    def __init__(self, bot_token: str, chat_id: str):
-        # Lazy import pra evitar dependência aqui
+    def __init__(self, *, bot_token: str, chat_id: str):
         self.bot_token = bot_token
         self.chat_id = chat_id
-        self._session = None
-
-    def _get_session(self):
-        if self._session is None:
-            import requests
-            from requests.adapters import HTTPAdapter, Retry
-            s = requests.Session()
-            retries = Retry(
-                total=5, backoff_factor=0.5,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["GET", "POST"],
-                respect_retry_after_header=True,
-            )
-            s.mount("https://", HTTPAdapter(max_retries=retries))
-            self._session = s
-        return self._session
 
     def build_message(
         self,
@@ -64,74 +94,79 @@ class TelegramPublisher:
         price: float,
         shop: str,
         offer: str,
-        rating: float | None = None,
-        discount_rate: float | None = None,
-        sales: int | None = None,
-        badge: str | None = None,
-        campaign: str | None = None,
-        sub_id: str | None = None,
-        cta_text: str = "🔗 Ver oferta",
+        rating: Optional[float],
+        discount_rate: Optional[float],
+        sales: Optional[int],
+        badge: Optional[str],
+        campaign: str,
+        sub_id: str,
+        category: str = "outros",
         below_median_30d: bool = False,
-        high_trust: bool = False,
+        cta_variant: str = "A",
     ) -> str:
-        """Formata a mensagem final no padrão:
-        **Título (nome)**
-        Corpo: 1–2 linhas da IA/fallback (sem preço/estrelas/CTA)
-        (linha opcional de porquê agora)
-        Rodapé com preço/loja/estrelas/vendas
-        CTA
-        """
-        title = f"**{product_name.strip()}**"
+        # título
+        title = _clean_title(product_name)
+        emoji = EMOJI_BY_CAT.get(category, "✨")
+        title_line = f"**{title}** {emoji}"
 
-        body = _strip_leading_name((texto_ia or "").strip(), product_name)
-        # Evita corpo vazio se strip removeu tudo
-        if not body:
-            body = "Benefício real para o dia a dia com ótimo custo‑benefício."
+        # corpo
+        body = _sanitize_body(texto_ia, product_name)
+        reason = _reason_now(discount_rate, below_median_30d, sales)
+        if reason:
+            body = f"{body}\n\n{reason}" if body else reason
 
-        why_now = None
-        if below_median_30d:
-            why_now = "Abaixo do preço mediano de 30 dias."
-        elif isinstance(discount_rate, (int, float)) and float(discount_rate) >= 0.40:
-            why_now = "Oferta forte hoje."
-        elif isinstance(sales, int) and sales >= 1000:
-            why_now = "Popular entre os compradores."
-
-        preco = _fmt_price(price)
-        stars = f"⭐ {rating:.1f}+" if isinstance(rating, (int, float)) and rating > 0 else None
-        vendas = f"{sales}+ vendidos" if isinstance(sales, int) and sales > 0 else None
-        trust = "Loja bem avaliada" if high_trust else None
-
-        pieces = [title, body]
-        if why_now:
-            pieces.append(why_now)
-
-        footer_lines = [f"Preço: {preco}", f"Loja: {shop}"]
-        line_rating_sales = " • ".join([p for p in [stars, vendas] if p])
-        if line_rating_sales:
-            footer_lines.append(line_rating_sales)
-        if trust:
-            footer_lines.append(trust)
-
-        pieces.append("\n".join(footer_lines))
+        # rodapé informacional
+        price_txt = _format_price_brl(price if price is not None else 0.0)
+        shop_txt = (shop or "").strip()
+        stars_sales_parts = []
+        if rating not in (None, ""):
+            try:
+                stars_sales_parts.append(f"⭐ {float(rating):.1f}+")
+            except Exception:
+                pass
+        if isinstance(sales, (int, float)) or (isinstance(sales, str) and sales.isdigit()):
+            stars_sales_parts.append(f"{int(sales)}+ vendidos")
+        stars_sales = " • ".join(stars_sales_parts) if stars_sales_parts else ""
+        trust = ""
+        try:
+            if rating is not None and float(rating) >= 4.8 and (int(sales or 0) >= 100):
+                trust = "\n(Loja bem avaliada)"
+        except Exception:
+            trust = ""
 
         # CTA
-        link = _append_sub_id(offer, sub_id)
-        pieces.append(f"{cta_text}\n{link}")
+        cta_text = CTA_LABELS.get(cta_variant.upper(), CTA_LABELS["A"])
+        url = _append_subid(offer, sub_id)
+        cta_line = f"{cta_text}\n{url}"
 
-        return "\n\n".join(pieces).strip()
+        parts = [
+            title_line.strip(),
+            body.strip(),
+            f"\nPreço: {price_txt}\nLoja: {shop_txt}",
+            f"{stars_sales}".strip(),
+            trust.strip(),
+            cta_line.strip(),
+        ]
+        # remova linhas vazias dobradas
+        msg = "\n".join([p for p in parts if p])
+        msg = re.sub(r"\n{3,}", "\n\n", msg).strip()
+        return msg
 
-    def send_message(self, text: str) -> str | None:
-        import requests
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+    # Placeholder de envio real — você já tinha um send_message no seu projeto
+    def send_message(self, message: str) -> Optional[str]:
+        import requests, os
+        token = self.bot_token
+        chat_id = self.chat_id
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
-            "chat_id": self.chat_id,
-            "text": text,
+            "chat_id": chat_id,
+            "text": message,
             "parse_mode": "Markdown",
             "disable_web_page_preview": False,
         }
-        r = self._get_session().post(url, json=payload, timeout=(8, 20))
+        r = requests.post(url, json=payload, timeout=20)
         r.raise_for_status()
         data = r.json()
-        if data.get("ok") and data.get("result"):
+        if data.get("ok") and data.get("result", {}).get("message_id"):
             return str(data["result"]["message_id"])
         return None
