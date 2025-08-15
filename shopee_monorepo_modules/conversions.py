@@ -55,8 +55,8 @@ def _build_args(
     return ", ".join(parts)
 
 CONVERSION_FIELDS = """
-  purchaseTime clickTime conversionId buyerType device utmContent referrer
-  netCommission totalCommission campaignType
+purchaseTime clickTime conversionId buyerType device utmContent referrer
+  netCommission totalCommission
   orders {
     orderId orderStatus shopType
     items {
