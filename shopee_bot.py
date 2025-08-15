@@ -492,26 +492,53 @@ def below_median_30d(db_path: str, item_id: int, current_price: Optional[float])
         return False
 
 # ===== Seleção final =====
+
 def select_with_caps_and_dedupe(
-    ranked: List[Tuple[float, Dict[str, Any], Dict[str, Any]]], *, max_posts: int, max_share: float
+    ranked: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
+    *,
+    max_posts: int,
+    max_share: float,
+    db: Storage,
+    cooldown_days: int
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
     cap = max(1, int(max_posts * max_share))
     chosen: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     cat_counts: Dict[str, int] = {}
     seen_norm: set[str] = set()
-    for item in ranked:
+
+    for final, ia_item, prod in ranked:
         if len(chosen) >= max_posts:
             break
-        _, ia_item, prod = item
         cat = tag_categoria(prod.get("productName") or "")
         norm = norm_name(prod.get("productName") or "")
+        item_id = int(prod.get("itemId") or 0)
+        if not item_id:
+            continue
+        # evita cooldown aqui (antes de tentar publicar)
+        if not db.can_repost(item_id, cooldown_days=cooldown_days):
+            continue
         if norm in seen_norm:
             continue
         if cat_counts.get(cat, 0) >= cap:
             continue
-        chosen.append(item)
+        chosen.append((final, ia_item, prod))
         seen_norm.add(norm)
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+    # fallback: se ainda não atingiu max_posts, revarre ignorando cap de categoria
+    if len(chosen) < max_posts:
+        for final, ia_item, prod in ranked:
+            if len(chosen) >= max_posts:
+                break
+            item_id = int(prod.get("itemId") or 0)
+            if not item_id or not db.can_repost(item_id, cooldown_days=cooldown_days):
+                continue
+            norm = norm_name(prod.get("productName") or "")
+            if norm in seen_norm:
+                continue
+            chosen.append((final, ia_item, prod))
+            seen_norm.add(norm)
+
     return chosen
 
 # ===== A/B por categoria =====
@@ -536,6 +563,19 @@ def pick_variant_for_category(category: str, rnd: random.Random) -> str:
     if rnd.random() < explore_pct:
         return "B" if base == "A" else "A"
     return base
+
+
+def is_below_median_30d(db: Storage, item_id: int, price_now: float|None) -> bool:
+    """Retorna True se preço atual < mediana 30 dias (-2% margem). Usa storage se disponível."""
+    if not price_now:
+        return False
+    try:
+        med = db.median_price_30d(item_id)  # sua Storage pode implementar; se não, cairemos no except
+        if med is None:
+            return False
+        return float(price_now) <= 0.98*float(med)
+    except Exception:
+        return False
 
 # ===== Publicação (A/B) =====
 def publish_ranked_ab(
@@ -771,7 +811,7 @@ def main():
         ranked.append((final, ia, p))
     ranked.sort(key=lambda x: x[0], reverse=True)
 
-    selected = select_with_caps_and_dedupe(ranked, max_posts=QTD_POSTS, max_share=MAX_CATEGORY_SHARE)
+    selected = select_with_caps_and_dedupe(ranked, max_posts=QTD_POSTS, max_share=MAX_CATEGORY_SHARE, db=db, cooldown_days=COOLDOWN_DIAS)
     logger.info("Selecionados (após caps/dedupe): %d", len(selected))
 
     posted = publish_ranked_ab(pub, db, selected, max_posts=QTD_POSTS, cooldown_days=COOLDOWN_DIAS, dry_run=DRY_RUN, db_path=DB_PATH)

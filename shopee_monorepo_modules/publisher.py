@@ -1,172 +1,170 @@
-# -*- coding: utf-8 -*-
+
 from __future__ import annotations
+import os, time, json, html, logging, requests
+from typing import Optional, Dict, Any
 
-import html
-import re
-from typing import Optional
+logger = logging.getLogger("publisher")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-EMOJI_BY_CAT = {
-    "mouse/teclado/periféricos": "🖱️",
-    "smartwatch/wearables": "⌚",
-    "caixa de som/speaker": "🔊",
-    "projetor": "📽️",
-    "cozinha (airfryer etc.)": "🍳",
-    "câmera/segurança": "📷",
-    "papelaria": "📝",
-    "outros": "✨",
-}
+TELEGRAM_API = "https://api.telegram.org"
 
-CTA_LABELS = {
-    "A": "🔗 Ver oferta",
-    "B": "🔗 Abrir no app",
-}
-
-TITLE_PREFIXES_TO_STRIP = [
-    r"super oferta\s*-\s*",
-    r"oferta relâmpago\s*-\s*",
-]
-
-TITLE_NOISE = [
-    "original", "usb", "com fio", "sem fio", "rgb", "led",
-]
-
-def _clean_title(name: str) -> str:
-    t = (name or "").strip()
-    for pat in TITLE_PREFIXES_TO_STRIP:
-        t = re.sub(pat, "", t, flags=re.IGNORECASE)
-    # compactar espaços e capitalização leve (sem gritar)
-    t = re.sub(r"\s{2,}", " ", t)
-    return t.strip()
-
-def _sanitize_body(text: str, product_name: str) -> str:
-    # evita repetir o nome do produto no corpo se já estiver no título
-    t = (text or "").strip()
-    # remove repetições do nome no início
-    pname = (product_name or "").strip()
-    if pname and t.lower().startswith(pname.lower()):
-        t = t[len(pname):].lstrip(": ").lstrip("- ").strip()
-    # tira excesso de espaços e pontuação
-    t = re.sub(r"\s{2,}", " ", t)
-    t = re.sub(r"[.!?]{2,}$", ".", t)
-    # reduz frases genéricas demais
-    t = t.replace("para o dia a dia com ótimo custo-benefício", "com ótimo custo-benefício no dia a dia")
-    return t.strip()
-
-def _format_price_brl(value: float) -> str:
-    if value is None:
-        return "-"
-    # formatação PT-BR simples
-    return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-def _reason_now(discount_rate: Optional[float], below_median_30d: bool, sales: Optional[int]) -> Optional[str]:
+def _fmt_price_br(v: float) -> str:
     try:
-        disc = float(discount_rate or 0.0)
+        return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
-        disc = 0.0
-    s = int(sales) if (isinstance(sales, (int, float, str)) and str(sales).isdigit()) else 0
+        return "—"
 
-    if below_median_30d:
-        return "Preço DESPENCOU"
-    if disc >= 0.40:
-        return "Só hoje."
-    if s >= 1000:
-        return "Está todo mundo comprando."
-    return None
+def _limit_len(s: str, max_chars: int = 3800) -> str:
+    s = s or ""
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars-3].rsplit(" ", 1)[0] + "..."
 
-def _append_subid(url: str, sub_id: str) -> str:
-    if not url:
-        return url
-    sep = "&" if "?" in url else "?"
-    if "sub_id=" in url:
-        return url
-    return f"{url}{sep}sub_id={sub_id}"
+def _escape_html(s: str) -> str:
+    return html.escape(s or "", quote=False)
 
 class TelegramPublisher:
-    def __init__(self, *, bot_token: str, chat_id: str):
+    def __init__(self, *, bot_token: str, chat_id: str|int, parse_mode: str = "HTML"):
         self.bot_token = bot_token
         self.chat_id = chat_id
+        self.parse_mode = parse_mode
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "OfferBot/1.5 (+telegram)"})
+        self.timeout = (8, 20)
+
+        # CTA variants
+        self.cta_variants = {
+            "A": "🔗 Ver oferta",
+            "B": "🔗 Abrir no app",
+        }
 
     def build_message(
         self,
         *,
-        product_name: str,
         texto_ia: str,
-        price: float,
-        shop: str,
+        price: float|None,
+        shop: str|None,
         offer: str,
-        rating: Optional[float],
-        discount_rate: Optional[float],
-        sales: Optional[int],
-        badge: Optional[str],
+        rating: float|None,
+        discount_rate: float|None,
+        sales: int|None,
+        badge: str|None,
         campaign: str,
         sub_id: str,
-        category: str = "outros",
-        below_median_30d: bool = False,
-        cta_variant: str = "A",
-    ) -> str:
-        # título
-        title = _clean_title(product_name)
-        emoji = EMOJI_BY_CAT.get(category, "✨")
-        title_line = f"**{title}** {emoji}"
+        variant: str|None = None,
+        abaixo_mediana_30d: bool|None = None,
+        popular: bool|None = None,
+        desconto_forte: bool|None = None,
+        emoji: str|None = None,
+        title: str|None = None,
+    ) -> Dict[str, Any]:
+        # Acrescenta sub_id na oferta
+        link = offer or ""
+        sep = "&" if "?" in link else "?"
+        link = f"{link}{sep}sub_id={_escape_html(sub_id)}"
 
-        # corpo
-        body = _sanitize_body(texto_ia, product_name)
-        reason = _reason_now(discount_rate, below_median_30d, sales)
-        if reason:
-            body = f"{body}\n\n{reason}" if body else reason
+        # Monta linhas do rodapé
+        linhas = []
+        if price:
+            linhas.append(f"Preço: {_escape_html(_fmt_price_br(price))}")
+        if shop:
+            linhas.append(f"Loja: {_escape_html(shop)}")
+        star_txt = []
+        if rating:
+            star_txt.append(f"⭐ {rating:.1f}+")
+        if sales and sales > 0:
+            star_txt.append(f"{sales:+d}".replace("+", "") + "+ vendidos")
+        if star_txt:
+            linhas.append(" • ".join(star_txt))
+        if rating and rating >= 4.8 and sales and sales >= 100:
+            linhas.append("Loja bem avaliada")
 
-        # rodapé informacional
-        price_txt = _format_price_brl(price if price is not None else 0.0)
-        shop_txt = (shop or "").strip()
-        stars_sales_parts = []
-        if rating not in (None, ""):
-            try:
-                stars_sales_parts.append(f"⭐ {float(rating):.1f}+")
-            except Exception:
-                pass
-        if isinstance(sales, (int, float)) or (isinstance(sales, str) and sales.isdigit()):
-            stars_sales_parts.append(f"{int(sales)}+ vendidos")
-        stars_sales = " • ".join(stars_sales_parts) if stars_sales_parts else ""
-        trust = ""
-        try:
-            if rating is not None and float(rating) >= 4.8 and (int(sales or 0) >= 100):
-                trust = "\n(Loja bem avaliada)"
-        except Exception:
-            trust = ""
+        # Motivo agora (apenas 1 linha)
+        motivo = None
+        if abaixo_mediana_30d:
+            motivo = "Preço DESPENCOU."
+        elif desconto_forte:
+            motivo = "SOMENTE Hoje."
+        elif popular:
+            motivo = "Todo mundo comprando."
+
+        # Título + corpo (HTML)
+        texto_ia = (texto_ia or "").strip()
+        # Garante uma linha de título em negrito se for passado separado
+        if title:
+            header = f"<b>{_escape_html(title.strip())}</b>"
+        else:
+            # tenta extrair a primeira parte antes de dois pontos como título
+            if ":" in texto_ia[:80]:
+                t, rest = texto_ia.split(":", 1)
+                header = f"<b>{_escape_html(t.strip())}</b>\n{_escape_html(rest.strip())}"
+                texto_ia = ""
+            else:
+                header = ""
+
+        corpo = _escape_html(texto_ia) if texto_ia else None
+
+        blocos = []
+        if header:
+            blocos.append(header)
+        if corpo:
+            blocos.append(corpo)
+        if motivo:
+            blocos.append(motivo)
+
+        footer = "\n".join([l for l in linhas if l])
+        if footer:
+            blocos.append(footer)
 
         # CTA
-        cta_text = CTA_LABELS.get(cta_variant.upper(), CTA_LABELS["A"])
-        url = _append_subid(offer, sub_id)
-        cta_line = f"{cta_text}\n{url}"
+        v = (variant or "A").upper()
+        cta_label = self.cta_variants.get(v, self.cta_variants["A"])
+        blocos.append(f'{cta_label}\n{link}')
 
-        parts = [
-            title_line.strip(),
-            body.strip(),
-            f"\nPreço: {price_txt}\nLoja: {shop_txt}",
-            f"{stars_sales}".strip(),
-            trust.strip(),
-            cta_line.strip(),
-        ]
-        # remova linhas vazias dobradas
-        msg = "\n".join([p for p in parts if p])
-        msg = re.sub(r"\n{3,}", "\n\n", msg).strip()
-        return msg
+        msg = "\n\n".join([b for b in blocos if b])
+        msg = _limit_len(msg, 3800)
 
-    # Placeholder de envio real — você já tinha um send_message no seu projeto
-    def send_message(self, message: str) -> Optional[str]:
-        import requests, os
-        token = self.bot_token
-        chat_id = self.chat_id
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "Markdown",
+        return {
+            "text": msg,
+            "parse_mode": self.parse_mode,
             "disable_web_page_preview": False,
         }
-        r = requests.post(url, json=payload, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("ok") and data.get("result", {}).get("message_id"):
-            return str(data["result"]["message_id"])
+
+    def send_message(self, payload: Dict[str, Any]) -> Optional[int]:
+        url = f"{TELEGRAM_API}/bot{self.bot_token}/sendMessage"
+        data = {
+            "chat_id": self.chat_id,
+            "text": payload["text"],
+            "parse_mode": payload.get("parse_mode", "HTML"),
+            "disable_web_page_preview": payload.get("disable_web_page_preview", True),
+        }
+
+        # Primeira tentativa (HTML)
+        try:
+            r = self.session.post(url, data=data, timeout=self.timeout)
+            if r.status_code == 200:
+                j = r.json()
+                return j.get("result", {}).get("message_id")
+            # Se der parse error, tenta sem parse_mode
+            desc = ""
+            try:
+                desc = r.json().get("description", "")
+            except Exception:
+                desc = r.text
+            if "can't parse entities" in (desc or "").lower():
+                logger.warning("Telegram parse error — reenviando sem parse_mode.")
+                data.pop("parse_mode", None)
+                r2 = self.session.post(url, data=data, timeout=self.timeout)
+                if r2.status_code == 200:
+                    j = r2.json()
+                    return j.get("result", {}).get("message_id")
+                else:
+                    logger.error("Telegram 2ª tentativa falhou: %s", r2.text)
+            else:
+                logger.error("Telegram erro %s: %s", r.status_code, desc)
+        except requests.HTTPError as he:
+            logger.error("HTTPError Telegram: %s", getattr(he.response, "text", str(he)))
+        except Exception as e:
+            logger.error("Erro Telegram: %s", e)
         return None
