@@ -1,9 +1,8 @@
-
 """
 ai.py — Geração de copy A/B com regras de marketing e saída estruturada.
-- Pylance-friendly: usa Annotated + Field (Pydantic v2)
-- Robusto: extrai o maior bloco JSON por balanço de chaves (sem regex recursiva)
-- Estilo: evita preço/%OFF/rating/vendas na copy e usa "hint" quando fornecido
+- Pylance-friendly (Pydantic v2 + Annotated/Field)
+- Robusto: extrai maior bloco JSON (sem regex recursiva)
+- Estilo: sem preço/%OFF/rating/vendas na copy e usa "hint" quando fornecido
 """
 from __future__ import annotations
 
@@ -17,17 +16,15 @@ except ImportError:  # pragma: no cover
 
 from pydantic import BaseModel, ValidationError, Field
 
-# ---------- Modelos ----------
 class IAItem(BaseModel):
     itemId: int
-    pontuacao: Annotated[int, Field(ge=0, le=100)]  # 0-100
+    pontuacao: Annotated[int, Field(ge=0, le=100)]
     texto_de_venda_a: str
     texto_de_venda_b: str
 
 class IAResponse(BaseModel):
     analise_de_produtos: List[IAItem]
 
-# ---------- Util: extração do maior bloco JSON ----------
 def _extract_json_blocks(text: str) -> List[str]:
     blocks: List[str] = []
     if not text:
@@ -66,7 +63,6 @@ def try_parse_ia(text: str) -> Optional[IAResponse]:
         except Exception:
             return None
         try:
-            # Tolerar modelos que devolvem só "texto_de_venda": duplicamos em A/B
             if isinstance(data, dict) and "analise_de_produtos" in data:
                 for it in data["analise_de_produtos"]:
                     if "texto_de_venda" in it and ("texto_de_venda_a" not in it or "texto_de_venda_b" not in it):
@@ -80,11 +76,9 @@ def try_parse_ia(text: str) -> Optional[IAResponse]:
     if parsed:
         return parsed
 
-    # autocorreção simples: remover trailing vírgulas (", }" → "}")
     sanitized = re.sub(r",\s*([}\]])", r"\1", candidate)
     return _attempt(sanitized)
 
-# ---------- Chamada ao modelo ----------
 def call_gemini(prompt: str, *, model: str = "gemini-1.5-flash", api_key: Optional[str] = None) -> str:
     if api_key is None:
         import os
@@ -100,9 +94,7 @@ def call_gemini(prompt: str, *, model: str = "gemini-1.5-flash", api_key: Option
     resp = gmodel.generate_content(prompt)
     return getattr(resp, "text", None) or ""
 
-# ---------- Função principal ----------
 def analyze_products(products: List[Dict[str, Any]], *, model: str = "gemini-1.5-flash", api_key: Optional[str] = None) -> IAResponse:
-    # Compactar dados relevantes e aceitar "hint" opcional vindo do bot
     compact: List[Dict[str, Any]] = []
     for p in products:
         compact.append({
@@ -114,12 +106,11 @@ def analyze_products(products: List[Dict[str, Any]], *, model: str = "gemini-1.5
             "priceMax": p.get("priceMax"),
             "discountRate": p.get("priceDiscountRate") or p.get("discount"),
             "link": p.get("productLink") or p.get("link") or p.get("offerLink"),
-            "hint": p.get("hint"),  # ex.: "2400 DPI", "IP67", "4L", "rotação 360°"
+            "hint": p.get("hint"),
         })
 
-    # Prompt: instruções claras para copy A/B enxuta e objetiva
     system = (
-        "Você é um copywriter de ofertas (português do Brasil). "
+        "Você é um copywriter de ofertas (pt-BR). "
         "Responda SOMENTE em JSON válido no esquema:\n"
         "{ \"analise_de_produtos\": [ { \"itemId\": int, \"pontuacao\": 0-100, "
         "\"texto_de_venda_a\": str, \"texto_de_venda_b\": str } ] }\n\n"
@@ -127,7 +118,7 @@ def analyze_products(products: List[Dict[str, Any]], *, model: str = "gemini-1.5
         "- Diga claramente o que é o produto usando o NOME recebido.\n"
         "- NÃO mencione preço, porcentagem de desconto, rating/avaliações, nem número de vendas.\n"
         "- 100–160 caracteres. Sem emojis e sem links.\n"
-        "- Use até UMA especificação concreta se fizer sentido (por exemplo: se houver o campo 'hint' com algo como '2400 DPI', 'IP67', '4L', 'rotação 360°').\n"
+        "- Use até UMA especificação concreta se fizer sentido (campo 'hint': '2400 DPI', 'IP67', '4L', 'rotação 360°').\n"
         "- Evite termos vagos como 'premium', 'incrível'; prefira benefícios objetivos e uso real.\n"
         "- Gere DUAS variações: A (benefício principal) e B (urgência leve)."
     )
@@ -138,15 +129,11 @@ def analyze_products(products: List[Dict[str, Any]], *, model: str = "gemini-1.5
     parsed = try_parse_ia(raw)
 
     if not parsed:
-        repair_prompt = (
-            f"{system}\n\nO JSON anterior estava inválido. Gere novamente, estritamente válido, sem comentários.\n"
-            f"{user}"
-        )
+        repair_prompt = f"{system}\n\nO JSON anterior estava inválido. Gere novamente, estritamente válido, sem comentários.\n{user}"
         raw2 = call_gemini(repair_prompt, model=model, api_key=api_key)
         parsed = try_parse_ia(raw2)
 
     if not parsed:
-        # Fallback conservador: gerar textos mínimos e nota média
         fallback: List[Dict[str, Any]] = []
         for p in compact:
             iid = p.get("itemId")

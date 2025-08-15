@@ -1,12 +1,9 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 shopee_bot.py — GraphQL + IA A/B + blocklist + diversidade + dedupe
-+ pós-processador de copy com:
-  - remoção de CTA na copy (CTA só no botão)
-  - evitar rating/%OFF/vendas na copy (fica no rodapé)
-  - injeção de "hint" (ex.: 2400 DPI, IP67, 4L, 360°) quando houver
++ pós-processador de copy (sem CTA/price/rating/vendas na copy, injeta hint)
++ integração com EV (valor esperado) via conversionReport
 """
 from __future__ import annotations
 
@@ -18,8 +15,8 @@ from requests.adapters import HTTPAdapter, Retry
 
 from storage import Storage
 from publisher import TelegramPublisher
-from scoring import compute_final_score
 from ai import analyze_products, IAResponse, IAItem
+from ev_signal import compute_ev_signal
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -29,7 +26,7 @@ logger = logging.getLogger("shopee_bot")
 AFFILIATE_ENDPOINT = "https://open-api.affiliate.shopee.com.br/graphql"
 DEFAULT_CONNECT_TIMEOUT = 8
 DEFAULT_READ_TIMEOUT = 20
-USER_AGENT = "OfferBot/1.3 (+https://github.com/yourrepo)"
+USER_AGENT = "OfferBot/1.4 (+https://github.com/yourrepo)"
 
 def make_session() -> requests.Session:
     s = requests.Session()
@@ -150,7 +147,7 @@ def coletar_ofertas(partner_id:int, api_key:str, *, keywords:List[str], shop_ids
         logger.info("Buscando %s=%r ...", fonte["tipo"], fonte["valor"])
         for page in range(1, paginas+1):
             try:
-                data = graphql_product_offer_v2(partner_id, api_key, keyword=str(fonte["valor"]), limit=itens_por_pagina, page=page) if fonte["tipo"]=="keyword"                            else graphql_product_offer_v2(partner_id, api_key, shop_id=int(fonte["valor"]), limit=itens_por_pagina, page=page)
+                data = graphql_product_offer_v2(partner_id, api_key, keyword=str(fonte["valor"]), limit=itens_por_pagina, page=page) if fonte["tipo"]=="keyword"                        else graphql_product_offer_v2(partner_id, api_key, shop_id=int(fonte["valor"]), limit=itens_por_pagina, page=page)
             except requests.HTTPError as he:
                 msg=getattr(he.response,"text",str(he)); logger.warning("HTTPError page=%s: %s", page, msg); break
             except Exception as e:
@@ -194,7 +191,7 @@ def filter_candidates(products: List[Dict[str,Any]], *, min_rating: float, min_d
             out.append(p)
     return out
 
-# --------- Copy guardrails ---------
+# --------- Guardrails da copy ---------
 PRICE_PAT = re.compile(r"(r\$\s?\d+[\.,]?\d*)|(%\s?off)", re.IGNORECASE)
 STAR_PAT  = re.compile(r"(\d[\.,]?\d\s*estrelas?)|(avalia[cç][aã]o\s*\d[\.,]?\d)", re.IGNORECASE)
 SALES_PAT = re.compile(r"(\d+\+?\s*vendas?)", re.IGNORECASE)
@@ -226,24 +223,21 @@ def sanitize_copy(text: str) -> str:
     t = PRICE_PAT.sub("", t)
     t = STAR_PAT.sub("", t)
     t = SALES_PAT.sub("", t)
-    t = CTA_PAT.sub("", t)   # CTA só no botão
+    t = CTA_PAT.sub("", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
     t = re.sub(r"[\.!\?]{2,}$", ".", t)
     return t
 
 def enforce_style(text: str, product_name: str, category: str, hint: Optional[str]=None) -> str:
     t = sanitize_copy(text)
-    # precisa mencionar produto ou categoria
     pn = (product_name or "").strip()
     if pn and pn[:8].lower() not in t.lower() and (category or "").lower() not in t.lower():
         t = f"{pn}: {t}"
-    # inserir hint se útil
     if hint and hint.lower() not in t.lower() and len(t) < 120:
         if ": " in t[:60]:
             t = t.replace(": ", f": {hint} — ", 1)
         else:
             t = f"{t} — {hint}"
-    # decidir se adiciona um fechamento curto
     if not URGENCY_TAIL.search(t) and len(t) < 90:
         t = (t + " Aproveite.").strip()
     if len(t) > 170:
@@ -251,7 +245,7 @@ def enforce_style(text: str, product_name: str, category: str, hint: Optional[st
     t = re.sub(r"!{2,}", "!", t)
     return t
 
-# --------- Seleção final com diversidade e dedupe ---------
+# --------- Seleção final ---------
 def select_with_caps_and_dedupe(ranked: List[Tuple[float, Dict[str,Any], Dict[str,Any]]], *, max_posts: int, max_share: float) -> List[Tuple[float, Dict[str,Any], Dict[str,Any]]]:
     cap = max(1, int(max_posts * max_share))
     chosen=[]; cat_counts={}; seen_norm=set()
@@ -297,11 +291,12 @@ def publish_ranked_ab(pub:TelegramPublisher, db:Storage, ranked:List[Tuple[float
         sales=prod.get("sales")
         discount_rate=prod.get("priceDiscountRate")
 
+        sub_id = f"{item_id}-{variant}-{time.strftime('%Y%m%d')}"
         msg=pub.build_message(texto_ia=texto, price=price, shop=shop, offer=offer,
                               rating=float(rating) if rating not in (None,"") else None,
                               discount_rate=discount_rate,
                               sales=int(sales) if isinstance(sales,(int,float,str)) and str(sales).isdigit() else None,
-                              badge=None, campaign=campaign, sub_id=str(item_id))
+                              badge=None, campaign=campaign, sub_id=sub_id)
         if dry_run:
             logger.info("[DRY RUN][%s] Postaria item %s | score=%.2f | %s", variant, item_id, final_score, offer)
             db.record_post(item_id, variant=variant, message_id=f"dryrun-{int(time.time())}"); posted+=1
@@ -337,6 +332,7 @@ def main():
     COOLDOWN_DIAS=getenv_int("COOLDOWN_REPOSTAGEM_DIAS",5)
     DRY_RUN=getenv_bool("DRY_RUN",False)
     MAX_CATEGORY_SHARE=float(os.getenv("MAX_CATEGORY_SHARE", "0.4"))
+    DB_PATH = os.getenv("DB_PATH", "data/bot.db")
 
     keywords=carregar_keywords()
     shop_ids=carregar_lojas_env()
@@ -372,6 +368,7 @@ def main():
         logger.warning("Sem candidatos após filtros. Encerrando.")
         return 0
 
+    from ai import analyze_products, IAResponse, IAItem
     ia_results=[]; BATCH=15
     for i in range(0, len(candidates), BATCH):
         batch=candidates[i:i+BATCH]
@@ -394,8 +391,12 @@ def main():
         iid=int(p["itemId"])
         ia=ia_by_id.get(iid)
         if not ia: continue
-        if float(ia.get("pontuacao",0))<MIN_IA_SCORE: continue
-        final=compute_final_score(float(ia.get("pontuacao",0)), float(p.get("priceDiscountRate") or 0.0), False)
+        ia_score=float(ia.get("pontuacao",0))
+        if ia_score<MIN_IA_SCORE: continue
+        ev = compute_ev_signal(DB_PATH, item_id=iid, product_name=p.get("productName",""), shop_name=p.get("shopName"))
+        ia_n  = ia_score/100.0
+        disc_n= float(p.get("priceDiscountRate") or 0.0)
+        final = 0.45*ia_n + 0.25*disc_n + 0.30*ev
         ranked.append((final, ia, p))
     ranked.sort(key=lambda x:x[0], reverse=True)
 

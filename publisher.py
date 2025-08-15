@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import random
@@ -7,7 +6,7 @@ from typing import Optional
 import requests
 
 TELEGRAM_API = "https://api.telegram.org"
-MIN_SALES_DISPLAY = 50  # novo limiar
+MIN_SALES_DISPLAY = 50  # não mostrar "1+ vendidos" etc.
 
 def with_utm(link: str, campaign: str, sub_id: Optional[str] = None) -> str:
     from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
@@ -17,15 +16,12 @@ def with_utm(link: str, campaign: str, sub_id: Optional[str] = None) -> str:
     u = u._replace(query=urlencode(q)); return urlunparse(u)
 
 def _split_headline(text: str) -> tuple[str, str]:
-    """Return (headline_sentence, remainder)."""
     s = (text or "").strip()
     if not s:
         return "", ""
-    # first sentence up to period or up to ~140 chars
     i = s.find(". ")
     if 0 < i < 140:
         return s[:i+1], s[i+2:]
-    # fallback: cut around 140 chars
     if len(s) > 140:
         cut = s[:140]
         j = cut.rfind(" ")
@@ -45,7 +41,7 @@ def _fmt_sales_br(sales: Optional[int]) -> str:
     except Exception:
         return ""
     if s < MIN_SALES_DISPLAY:
-        return ""  # oculta prova social fraca
+        return ""
     if s >= 1000:
         k = s / 1000.0
         k_str = f"{k:.1f}".rstrip("0").rstrip(".").replace(".", ",")
@@ -102,7 +98,6 @@ class TelegramPublisher:
         headline, rest = _split_headline(texto_ia)
         offer_url = with_utm(offer, campaign=campaign, sub_id=sub_id)
 
-        # Price line (prefer "de/por" when discount_rate is valid)
         preco_fmt = _fmt_currency_br(price)
         price_line = f"<b>Preço:</b> R$ {preco_fmt}"
         try:
@@ -121,6 +116,7 @@ class TelegramPublisher:
         sales_txt = _fmt_sales_br(sales)
         badge_line = f" • {escape(badge)}" if badge else ""
 
+        import random
         link_label = random.choice(["Ver oferta", "Comprar com desconto", "Ir à oferta", "Aproveitar oferta"])
 
         msg = (
