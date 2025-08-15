@@ -42,6 +42,9 @@ jobs:
       COOLDOWN_REPOSTAGEM_DIAS: "5"
       MAX_CATEGORY_SHARE: "0.5"
       DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+      IA_TOP_K: "10"         # chama IA só para os 10 melhores
+      IA_BATCH_SIZE: "10"    # 1 chamada se houver até 10 itens
+      IA_ENABLED: "1"        # troque para "0" se quiser desativar IA temporariamente
 
     steps:
       - name: Checkout
