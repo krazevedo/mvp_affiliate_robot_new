@@ -1,128 +1,137 @@
-from __future__ import annotations
-
-import random
-from html import escape
+import os
+import re
 from typing import Optional
-import requests
 
-TELEGRAM_API = "https://api.telegram.org"
-MIN_SALES_DISPLAY = 50  # não mostrar "1+ vendidos" etc.
-
-def with_utm(link: str, campaign: str, sub_id: Optional[str] = None) -> str:
-    from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
-    u = urlparse(link); q = dict(parse_qsl(u.query))
-    q.update({"utm_source": "telegram", "utm_medium": "bot", "utm_campaign": campaign})
-    if sub_id: q["sub_id"] = sub_id
-    u = u._replace(query=urlencode(q)); return urlunparse(u)
-
-def _split_headline(text: str) -> tuple[str, str]:
-    s = (text or "").strip()
-    if not s:
-        return "", ""
-    i = s.find(". ")
-    if 0 < i < 140:
-        return s[:i+1], s[i+2:]
-    if len(s) > 140:
-        cut = s[:140]
-        j = cut.rfind(" ")
-        if j > 0:
-            return cut[:j] + "...", s[j+1:]
-    return s, ""
-
-def _fmt_currency_br(v: float) -> str:
-    s = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return s
-
-def _fmt_sales_br(sales: Optional[int]) -> str:
-    if sales is None:
-        return ""
+def _fmt_price(v) -> str:
     try:
-        s = int(sales)
+        f = float(v)
+        return f"R$ {f:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
+        return "-"
+
+
+def _append_sub_id(url: str, sub_id: Optional[str]) -> str:
+    if not url or not sub_id:
+        return url or ""
+    sep = "&" if "?" in url else "?"
+    # Shopee usa subId ou sub_id dependendo do link. Preferimos subId.
+    if "subId=" in url or "sub_id=" in url:
+        return url
+    return f"{url}{sep}subId={sub_id}"
+
+
+def _strip_leading_name(body: str, product_name: str) -> str:
+    """Remove o nome no início do corpo se ele já for o título."""
+    if not body:
         return ""
-    if s < MIN_SALES_DISPLAY:
-        return ""
-    if s >= 1000:
-        k = s / 1000.0
-        k_str = f"{k:.1f}".rstrip("0").rstrip(".").replace(".", ",")
-        return f" • {k_str} mil+ vendidos"
-    return f" • {s}+ vendidos"
+    b = body.strip()
+    pn = (product_name or "").strip()
+    if not pn:
+        return b
+    # Se começa com o nome + ":" ou " - " removemos essa parte
+    pattern = re.compile(rf"^\s*{re.escape(pn)}\s*[:\-–—]\s*", re.IGNORECASE)
+    b = pattern.sub("", b, count=1)
+    return b.strip()
+
 
 class TelegramPublisher:
-    def __init__(self, bot_token: str, chat_id: str, rate_limit_per_sec: float = 1.0):
+    def __init__(self, bot_token: str, chat_id: str):
+        # Lazy import pra evitar dependência aqui
         self.bot_token = bot_token
         self.chat_id = chat_id
-        self.session = requests.Session()
-        self._rate_tokens = 5
-        self._rate_per_sec = rate_limit_per_sec
-        self._last_ts = 0.0
+        self._session = None
 
-    def _consume_rate(self):
-        import time
-        now = time.time()
-        delta = now - self._last_ts
-        self._rate_tokens = min(5, self._rate_tokens + delta * self._rate_per_sec)
-        self._last_ts = now
-        if self._rate_tokens < 1:
-            sleep_for = (1 - self._rate_tokens) / self._rate_per_sec
-            time.sleep(max(0.0, sleep_for))
-            self._rate_tokens = 0.0
-        else:
-            self._rate_tokens -= 1
-
-    def send_message(self, text: str, disable_web_page_preview: bool = False) -> Optional[int]:
-        self._consume_rate()
-        url = f"{TELEGRAM_API}/bot{self.bot_token}/sendMessage"
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": disable_web_page_preview}
-        r = self.session.post(url, json=payload, timeout=(8, 20))
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("ok"):
-            return None
-        return int(data["result"]["message_id"])
+    def _get_session(self):
+        if self._session is None:
+            import requests
+            from requests.adapters import HTTPAdapter, Retry
+            s = requests.Session()
+            retries = Retry(
+                total=5, backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "POST"],
+                respect_retry_after_header=True,
+            )
+            s.mount("https://", HTTPAdapter(max_retries=retries))
+            self._session = s
+        return self._session
 
     def build_message(
         self,
         *,
+        product_name: str,
         texto_ia: str,
         price: float,
         shop: str,
         offer: str,
-        rating: Optional[float] = None,
-        discount_rate: Optional[float] = None,
-        sales: Optional[int] = None,
-        badge: Optional[str] = None,
-        campaign: str = "",
-        sub_id: Optional[str] = None,
+        rating: float | None = None,
+        discount_rate: float | None = None,
+        sales: int | None = None,
+        badge: str | None = None,
+        campaign: str | None = None,
+        sub_id: str | None = None,
+        cta_text: str = "🔗 Ver oferta",
+        below_median_30d: bool = False,
+        high_trust: bool = False,
     ) -> str:
-        headline, rest = _split_headline(texto_ia)
-        offer_url = with_utm(offer, campaign=campaign, sub_id=sub_id)
+        """Formata a mensagem final no padrão:
+        **Título (nome)**
+        Corpo: 1–2 linhas da IA/fallback (sem preço/estrelas/CTA)
+        (linha opcional de porquê agora)
+        Rodapé com preço/loja/estrelas/vendas
+        CTA
+        """
+        title = f"**{product_name.strip()}**"
 
-        preco_fmt = _fmt_currency_br(price)
-        price_line = f"<b>Preço:</b> R$ {preco_fmt}"
-        try:
-            dr = float(discount_rate) if discount_rate is not None else None
-        except Exception:
-            dr = None
-        if dr is not None and 0.0 < dr < 1.0:
-            try:
-                de = price / (1.0 - dr)
-                de_fmt = _fmt_currency_br(de)
-                price_line = f"<b>Preço:</b> <s>R$ {de_fmt}</s> R$ {preco_fmt}"
-            except Exception:
-                pass
+        body = _strip_leading_name((texto_ia or "").strip(), product_name)
+        # Evita corpo vazio se strip removeu tudo
+        if not body:
+            body = "Benefício real para o dia a dia com ótimo custo‑benefício."
 
-        stars = f"\n⭐ <b>{rating:.1f}+</b>" if rating is not None else ""
-        sales_txt = _fmt_sales_br(sales)
-        badge_line = f" • {escape(badge)}" if badge else ""
+        why_now = None
+        if below_median_30d:
+            why_now = "Abaixo do preço mediano de 30 dias."
+        elif isinstance(discount_rate, (int, float)) and float(discount_rate) >= 0.40:
+            why_now = "Oferta forte hoje."
+        elif isinstance(sales, int) and sales >= 1000:
+            why_now = "Popular entre os compradores."
 
-        import random
-        link_label = random.choice(["Ver oferta", "Comprar com desconto", "Ir à oferta", "Aproveitar oferta"])
+        preco = _fmt_price(price)
+        stars = f"⭐ {rating:.1f}+" if isinstance(rating, (int, float)) and rating > 0 else None
+        vendas = f"{sales}+ vendidos" if isinstance(sales, int) and sales > 0 else None
+        trust = "Loja bem avaliada" if high_trust else None
 
-        msg = (
-            f"<b>{escape(headline)}</b> {escape(rest)}\n\n"
-            f"{price_line}\n"
-            f"<b>Loja:</b> {escape(shop)}{stars}{sales_txt}{badge_line}\n"
-            f"<a href=\"{escape(offer_url)}\"><b>{link_label}</b></a>"
-        )
-        return msg
+        pieces = [title, body]
+        if why_now:
+            pieces.append(why_now)
+
+        footer_lines = [f"Preço: {preco}", f"Loja: {shop}"]
+        line_rating_sales = " • ".join([p for p in [stars, vendas] if p])
+        if line_rating_sales:
+            footer_lines.append(line_rating_sales)
+        if trust:
+            footer_lines.append(trust)
+
+        pieces.append("\n".join(footer_lines))
+
+        # CTA
+        link = _append_sub_id(offer, sub_id)
+        pieces.append(f"{cta_text}\n{link}")
+
+        return "\n\n".join(pieces).strip()
+
+    def send_message(self, text: str) -> str | None:
+        import requests
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False,
+        }
+        r = self._get_session().post(url, json=payload, timeout=(8, 20))
+        r.raise_for_status()
+        data = r.json()
+        if data.get("ok") and data.get("result"):
+            return str(data["result"]["message_id"])
+        return None
