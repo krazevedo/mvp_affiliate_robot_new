@@ -1,0 +1,32 @@
+name: Trend Hunter
+
+# Gatilho (trigger): permite que a gente rode manualmente
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Baixa o código do repositório
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Configura o ambiente Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 3. Instala as dependências (as mesmas do outro robô)
+      - name: Install dependencies
+        run: pip install requests google-generativeai
+
+      # 4. Executa o nosso novo robô caçador!
+      - name: Run Trend Hunter Bot
+        run: python trend_hunter.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }} # Adicionar
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}   # Adicionar

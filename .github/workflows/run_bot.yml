@@ -1,0 +1,114 @@
+name: Shopee Affiliate Bot
+
+on:
+  # 11:00, 15:00 e 19:00 UTC  ≈ 08:00, 12:00, 16:00 America/Sao_Paulo
+  schedule:
+    - cron: "0 11,15,19 * * *"
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Não postar no Telegram (somente log)"
+        type: boolean
+        default: false
+      QTD_POSTS:
+        description: "Quantidade de posts por execução"
+        type: number
+        default: 6
+      PAGINAS_A_VERIFICAR:
+        description: "Páginas por fonte (keyword/loja)"
+        type: number
+        default: 2
+      ITENS_POR_PAGINA:
+        description: "Itens por página da API"
+        type: number
+        default: 15
+      MIN_RATING:
+        description: "Rating mínimo"
+        type: number
+        default: 4.7
+      MIN_DISCOUNT:
+        description: "Desconto mínimo (0.15 = 15%)"
+        type: number
+        default: 0.15
+      MIN_IA_SCORE:
+        description: "Score mínimo da IA"
+        type: number
+        default: 65
+      MAX_CATEGORY_SHARE:
+        description: "Limite de % por categoria (0.4 = 40%)"
+        type: number
+        default: 0.4
+      BLOCKLIST_TERMS:
+        description: "Termos para bloquear (separados por vírgula)"
+        type: string
+        default: "espi,espiã,pmpo,chatgpt,4k,i12"
+
+concurrency:
+  group: shopee-bot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Timezone de logs do Python (opcional)
+      TZ: America/Sao_Paulo
+      # Garante que os módulos funcionem tanto na raiz quanto em shopee_monorepo_modules/
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/shopee_monorepo_modules
+
+      # --- Segredos obrigatórios (configure em Settings > Secrets and variables > Actions > Secrets) ---
+      SHOPEE_PARTNER_ID: ${{ secrets.SHOPEE_PARTNER_ID }}
+      SHOPEE_API_KEY: ${{ secrets.SHOPEE_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # --- Parâmetros com fallback (workflow_dispatch > vars > defaults) ---
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRY_RUN || 'false' }}
+      QUANTIDADE_DE_POSTS_POR_EXECUCAO: ${{ github.event_name == 'workflow_dispatch' && inputs.QTD_POSTS || vars.QTD_POSTS || '6' }}
+      PAGINAS_A_VERIFICAR: ${{ github.event_name == 'workflow_dispatch' && inputs.PAGINAS_A_VERIFICAR || vars.PAGINAS_A_VERIFICAR || '2' }}
+      ITENS_POR_PAGINA: ${{ github.event_name == 'workflow_dispatch' && inputs.ITENS_POR_PAGINA || vars.ITENS_POR_PAGINA || '15' }}
+      MIN_RATING: ${{ github.event_name == 'workflow_dispatch' && inputs.MIN_RATING || vars.MIN_RATING || '4.7' }}
+      MIN_DISCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.MIN_DISCOUNT || vars.MIN_DISCOUNT || '0.15' }}
+      MIN_IA_SCORE: ${{ github.event_name == 'workflow_dispatch' && inputs.MIN_IA_SCORE || vars.MIN_IA_SCORE || '65' }}
+      MAX_CATEGORY_SHARE: ${{ github.event_name == 'workflow_dispatch' && inputs.MAX_CATEGORY_SHARE || vars.MAX_CATEGORY_SHARE || '0.4' }}
+      BLOCKLIST_TERMS: ${{ github.event_name == 'workflow_dispatch' && inputs.BLOCKLIST_TERMS || vars.BLOCKLIST_TERMS || 'espi,espiã,pmpo,chatgpt,4k,i12' }}
+
+      # (opcional) Keywords/lojas via Variables (Settings > Secrets and variables > Actions > Variables)
+      SHOPEE_KEYWORDS: ${{ vars.SHOPEE_KEYWORDS }} # ex: "gadgets,casa,beleza"
+      SHOPEE_SHOP_IDS: ${{ vars.SHOPEE_SHOP_IDS }} # ex: "369632653,288420684"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Ensure data dir
+        run: mkdir -p data
+
+      - name: Run bot
+        run: |
+          set -e
+          python shopee_bot.py 2>&1 | tee run.log
+
+      - name: Upload DB and logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopee-bot-${{ github.run_id }}
+          path: |
+            data/bot.db
+            run.log
+          if-no-files-found: warn
