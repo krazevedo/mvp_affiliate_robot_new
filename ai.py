@@ -1,34 +1,52 @@
-
 """
-ai.py — IA com saída estruturada (A/B) e penalidades.
-Gera para cada item: { itemId, pontuacao, texto_de_venda_a, texto_de_venda_b }
+ai.py — IA com saída estruturada (A/B) e penalidades — Pylance-friendly.
+- Usa Annotated + Field (sem conint(...) na annotation).
+- Extrator de JSON por balanço de chaves (sem regex recursiva).
 """
 from __future__ import annotations
 
 import json
 import re
 from typing import Any, Dict, List, Optional
+try:
+    from typing import Annotated  # Py3.9+
+except ImportError:  # pragma: no cover
+    from typing_extensions import Annotated  # fallback
 
 from pydantic import BaseModel, ValidationError, Field
-try:
-    from typing import Annotated
-except ImportError:
-    from typing_extensions import Annotated
 
 # ----- Modelos de saída -----
 class IAItem(BaseModel):
     itemId: int
-    pontuacao: Annotated[int, Field(ge=0, le=100)]
+    pontuacao: Annotated[int, Field(ge=0, le=100)]  # 0-100
     texto_de_venda_a: str
     texto_de_venda_b: str
 
 class IAResponse(BaseModel):
     analise_de_produtos: List[IAItem]
 
-JSON_BLOCK_RE = re.compile(r"\{(?:[^{}]|(?R))*\}", re.DOTALL)
+def _extract_json_blocks(text: str) -> List[str]:
+    """Extrai blocos potencialmente JSON balanceando chaves { } no texto."""
+    blocks: List[str] = []
+    if not text:
+        return blocks
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    blocks.append(text[start:i+1])
+                    start = None
+    return blocks
 
 def largest_json_block(text: str) -> Optional[str]:
-    blocks = JSON_BLOCK_RE.findall(text or "")
+    blocks = _extract_json_blocks(text or "")
     if not blocks:
         return None
     return max(blocks, key=len)
@@ -39,6 +57,7 @@ def try_parse_ia(text: str) -> Optional[IAResponse]:
     candidate = largest_json_block(text)
     if not candidate:
         return None
+
     def _attempt(s: str):
         try:
             data = json.loads(s)
@@ -54,10 +73,12 @@ def try_parse_ia(text: str) -> Optional[IAResponse]:
             return IAResponse.model_validate(data)
         except ValidationError:
             return None
+
     parsed = _attempt(candidate)
     if parsed:
         return parsed
-    # autocorreção simples: remover trailing vírgulas
+
+    # autocorreção simples: remover trailing vírgulas (", }" → "}")
     sanitized = re.sub(r",\s*([}\]])", r"\1", candidate)
     return _attempt(sanitized)
 
@@ -69,7 +90,7 @@ def call_gemini(prompt: str, *, model: str = "gemini-1.5-flash", api_key: Option
         raise RuntimeError("GEMINI_API_KEY não configurada.")
     try:
         import google.generativeai as genai
-    except ImportError as e:
+    except ImportError as e:  # pragma: no cover
         raise RuntimeError("Pacote google-generativeai não instalado. `pip install google-generativeai`") from e
     genai.configure(api_key=api_key)
     gmodel = genai.GenerativeModel(model)
@@ -120,7 +141,7 @@ def analyze_products(products: List[Dict[str, Any]], *, model: str = "gemini-1.5
         fallback = []
         for p in compact:
             iid = p.get("itemId")
-            if not iid: 
+            if not iid:
                 continue
             name = (p.get("name") or "Oferta").strip()
             fallback.append({
