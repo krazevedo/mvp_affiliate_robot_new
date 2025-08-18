@@ -48,7 +48,7 @@ class TelegramPublisher:
         meta_line = " • ".join(meta) if meta else ""
 
         url = _safe_url(link)
-        msg_html = f"<b>{t}</b>\n\nPreço: <b>{price}</b>\nLoja: {s}\n{meta_line}\n\n<a href=\"{url}\">{cta_txt}</a> • Variante: {variant}"
+        msg_html = f"<b>{t}</b>\n\nPreço: <b>{price}</b>\nLoja: {s}\n{meta_line}\n\n<a href=\"{url}\">{cta_txt}</a>"
 
         payload = {
             "chat_id": self.chat_id,
@@ -62,7 +62,7 @@ class TelegramPublisher:
         except requests.HTTPError as e:
             # Fallback 1: enviar sem parse_mode (texto puro com link em linha separada)
             log.warning("HTML falhou, tentando texto puro. Motivo: %s", str(e))
-            plain = f"{title}\n\nPreço: {price}\nLoja: {store}\n{meta_line}\n\n{cta}:\n{url}\nVariante: {variant}"
+            plain = f"{title}\n\nPreço: {price}\nLoja: {store}\n{meta_line}\n\n{cta}:\n{url}\n"
             payload2 = {
                 "chat_id": self.chat_id,
                 "text": plain[:3900],

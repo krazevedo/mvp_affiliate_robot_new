@@ -340,6 +340,81 @@ def filter_quality_by_category(products: List[Dict[str, Any]], *, min_rating: fl
             out.append(p)
     return out
 
+
+# ==== Config & Helpers de Título/Copy (anti-repetição/sem 'Aproveite' no título) ====
+TITLE_MAX_LEN = getenv_int("TITLE_MAX_LEN", 110)  # limite para títulos no Telegram
+INCLUDE_APROVEITE_IN_TITLE = getenv_bool("INCLUDE_APROVEITE_IN_TITLE", False)
+
+def compact_name(product_name: str) -> str:
+    """Remove ruído e encurta o nome mantendo marca + substantivo principal."""
+    s = (product_name or "").strip()
+    # remover termos redundantes comuns
+    s = re.sub(r"\b(?i)(original|novo|gamer|bluetooth|wireless|com fio|sem fio|rgb|led|headset)\b", "", s)
+    # normaliza espaços
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    # limitar para ~8 palavras para caber no mobile
+    parts = s.split()
+    if len(parts) > 8:
+        s = " ".join(parts[:8])
+    return s
+
+def remove_redundancy(copy_txt: str, product_name: str) -> str:
+    """Evita repetição do nome do produto e CTAs desnecessárias na copy curta."""
+    t = (copy_txt or "").strip()
+    pn = (product_name or "").strip()
+    if not t:
+        return t
+    # Se começa com o nome, remove prefixo
+    if pn and t.lower().startswith(pn.lower()):
+        t = t[len(pn):].lstrip(":–- ").strip()
+    # Remove duplicatas simples separadas por pontuação comum
+    chunks = [c.strip() for c in re.split(r"[—:\.]", t) if c.strip()]
+    dedup = []
+    seen = set()
+    for c in chunks:
+        key = c.lower()
+        if key not in seen:
+            dedup.append(c)
+            seen.add(key)
+    t = " — ".join(dedup)
+    # remove CTA (será adicionada pelo botão/rodapé do publisher)
+    t = re.sub(r"\b(aproveite|garanta (o seu|a sua)|ver oferta|compre agora)\b[\.!\s]*$", "", t, flags=re.I).strip()
+    # limpeza final
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"[!?.]{2,}$", "", t)
+    return t
+
+def clip_len(s: str, max_len: int) -> str:
+    """Corta sem '...' e sem quebrar palavras, privilegiando legibilidade."""
+    if len(s) <= max_len:
+        return s
+    short = s[:max_len+1].rsplit(" ", 1)[0].rstrip("—,;: ")
+    if len(short) < max_len * 0.66:
+        short = s[:max_len].strip()
+    return short
+
+def make_headline(product_name: str, category: str, ia_text: str) -> str:
+    """Título final: emoji + nome compacto + benefício (sem CTA, sem repetição)."""
+    emoji = EMOJI_BY_CAT.get(category, "✨")
+    base = compact_name(product_name)
+    benefit = remove_redundancy(ia_text, product_name)
+    if not benefit:
+        defaults = {
+            "mouse/teclado/periféricos": "precisão e conforto no uso diário",
+            "smartwatch/wearables": "medições práticas e visual moderno",
+            "caixa de som/speaker": "som equilibrado para músicas e vídeos",
+            "projetor": "imagem nítida para filmes e séries",
+            "cozinha (airfryer etc.)": "praticidade e menos sujeira",
+            "câmera/segurança": "monitoramento simples e confiável",
+            "papelaria": "organização e produtividade",
+            "outros": "funcional para o dia a dia",
+        }
+        benefit = defaults.get(category, "funcional para o dia a dia")
+    title = f"{emoji} {base} — {benefit}".strip()
+    if not INCLUDE_APROVEITE_IN_TITLE:
+        title = re.sub(r"\bAproveite\b\.?$", "", title, flags=re.I).strip()
+    title = clip_len(title, TITLE_MAX_LEN)
+    return title
 # ===== Guardrails / Heurísticas de copy =====
 PRICE_PAT = re.compile(r"(r\$\s?\d+[\.,]?\d*)|(%\s?off)", re.IGNORECASE)
 STAR_PAT = re.compile(r"(\d[\.,]?\d\s*estrelas?)|(avalia[cç][aã]o\s*\d[\.,]?\d)", re.IGNORECASE)
@@ -424,28 +499,31 @@ def heuristic_score(prod: Dict[str, Any], db_path: str) -> float:
     )
     return 0.45 * disc + 0.35 * rating_n + 0.20 * ev
 
+
 def heuristic_copies(prod: Dict[str, Any]) -> Dict[str, Any]:
     name = str(prod.get("productName") or "Oferta").strip()
     cat = tag_categoria(name)
     hint = derive_hint(name)
-    if "cetin" in name.lower() or "touca" in name.lower() or "gorro" in name.lower():
-        a = f"Reduz frizz e preserva a hidratação dos fios durante a noite."
-        b = f"Conforto na hora de dormir com proteção anti-frizz para acordar com menos volume."
+
+    if "cetim" in name.lower() or "touca" in name.lower() or "gorro" in name.lower():
+        a = "menos frizz e fios protegidos durante a noite"
+        b = "conforto ao dormir com tecido macio e anti-frizz"
     elif cat == "mouse/teclado/periféricos":
-        a = f"Precisão e resposta para elevar seu jogo — 6 botões e {hint or 'design ergonômico'}."
-        b = f"Controle rápido com {hint or 'sensor ajustável'} e iluminação para sua setup."
+        a = f"precisão e resposta para elevar seu jogo{(' — ' + hint) if hint else ''}"
+        b = f"controle rápido e pegada confortável{(' — ' + hint) if hint else ''}"
     elif cat == "caixa de som/speaker":
-        a = f"Som equilibrado para músicas e vídeos, com {hint or 'graves reforçados'}."
-        b = f"Portátil e prático, ideal para levar o som a qualquer ambiente."
+        a = "som equilibrado e portabilidade para qualquer ambiente"
+        b = f"áudio limpo para músicas e vídeos{(' — ' + hint) if hint else ''}"
+    elif cat == "cozinha (airfryer etc.)":
+        a = "menos sujeira e praticidade no preparo"
+        b = "reutilizável e fácil de limpar"
     else:
-        a = f"Praticidade diária com {hint or 'bom acabamento'}."
-        b = f"Funcional para diferentes usos no dia a dia."
-    a = enforce_style(a, name, cat, hint=hint)
-    b = enforce_style(b, name, cat, hint=hint)
-    return {
-        "texto_de_venda_a": a,
-        "texto_de_venda_b": b,
-    }
+        a = "praticidade para o dia a dia"
+        b = "funcional e versátil"
+
+    a = remove_redundancy(a, name)
+    b = remove_redundancy(b, name)
+    return {"texto_de_venda_a": a, "texto_de_venda_b": b}
 
 # ===== Deduplicação por assinatura =====
 def dedupe_by_signature(candidates: List[Dict[str, Any]], db_path: str) -> List[Dict[str, Any]]:
@@ -749,10 +827,8 @@ def main():
             text_b = ia.get("texto_de_venda_b")
             variant = pick_variant_for_category(cat, rnd)
             raw_text = text_a if variant == "A" else text_b
-            texto = enforce_style(raw_text, pname, cat, hint=hint)
-
             # Título inclui a copy (para compatibilidade com publisher atual)
-            title = build_title(pname, texto, cat)
+            title = make_headline(pname, cat, raw_text)
 
             # Rodapé/CTA/link
             try:
