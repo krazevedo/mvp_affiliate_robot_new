@@ -1,170 +1,84 @@
-
+# publisher.py — envio robusto ao Telegram (HTML seguro + fallbacks)
 from __future__ import annotations
-import os, time, json, html, logging, requests
+import requests, html, time, logging
 from typing import Optional, Dict, Any
 
-logger = logging.getLogger("publisher")
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("publisher")
 
-TELEGRAM_API = "https://api.telegram.org"
+def _escape_html_text(s: str) -> str:
+    # escapa texto; não use para URLs
+    return html.escape(s, quote=True)
 
-def _fmt_price_br(v: float) -> str:
-    try:
-        return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return "—"
-
-def _limit_len(s: str, max_chars: int = 3800) -> str:
-    s = s or ""
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars-3].rsplit(" ", 1)[0] + "..."
-
-def _escape_html(s: str) -> str:
-    return html.escape(s or "", quote=False)
+def _safe_url(url: str) -> str:
+    # Telegram aceita & sem precisar virar &amp; no atributo href
+    return url.strip()
 
 class TelegramPublisher:
-    def __init__(self, *, bot_token: str, chat_id: str|int, parse_mode: str = "HTML"):
-        self.bot_token = bot_token
+    def __init__(self, bot_token: str, chat_id: str, timeout: int = 15):
+        self.base = f"https://api.telegram.org/bot{bot_token}"
         self.chat_id = chat_id
-        self.parse_mode = parse_mode
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "OfferBot/1.5 (+telegram)"})
-        self.timeout = (8, 20)
+        self.timeout = timeout
 
-        # CTA variants
-        self.cta_variants = {
-            "A": "🔗 Ver oferta",
-            "B": "🔗 Abrir no app",
-        }
-
-    def build_message(
-        self,
-        *,
-        texto_ia: str,
-        price: float|None,
-        shop: str|None,
-        offer: str,
-        rating: float|None,
-        discount_rate: float|None,
-        sales: int|None,
-        badge: str|None,
-        campaign: str,
-        sub_id: str,
-        variant: str|None = None,
-        abaixo_mediana_30d: bool|None = None,
-        popular: bool|None = None,
-        desconto_forte: bool|None = None,
-        emoji: str|None = None,
-        title: str|None = None,
-    ) -> Dict[str, Any]:
-        # Acrescenta sub_id na oferta
-        link = offer or ""
-        sep = "&" if "?" in link else "?"
-        link = f"{link}{sep}sub_id={_escape_html(sub_id)}"
-
-        # Monta linhas do rodapé
-        linhas = []
-        if price:
-            linhas.append(f"Preço: {_escape_html(_fmt_price_br(price))}")
-        if shop:
-            linhas.append(f"Loja: {_escape_html(shop)}")
-        star_txt = []
-        if rating:
-            star_txt.append(f"⭐ {rating:.1f}+")
-        if sales and sales > 0:
-            star_txt.append(f"{sales:+d}".replace("+", "") + "+ vendidos")
-        if star_txt:
-            linhas.append(" • ".join(star_txt))
-        if rating and rating >= 4.8 and sales and sales >= 100:
-            linhas.append("Loja bem avaliada")
-
-        # Motivo agora (apenas 1 linha)
-        motivo = None
-        if abaixo_mediana_30d:
-            motivo = "Preço DESPENCOU."
-        elif desconto_forte:
-            motivo = "SOMENTE Hoje."
-        elif popular:
-            motivo = "Todo mundo comprando."
-
-        # Título + corpo (HTML)
-        texto_ia = (texto_ia or "").strip()
-        # Garante uma linha de título em negrito se for passado separado
-        if title:
-            header = f"<b>{_escape_html(title.strip())}</b>"
-        else:
-            # tenta extrair a primeira parte antes de dois pontos como título
-            if ":" in texto_ia[:80]:
-                t, rest = texto_ia.split(":", 1)
-                header = f"<b>{_escape_html(t.strip())}</b>\n{_escape_html(rest.strip())}"
-                texto_ia = ""
-            else:
-                header = ""
-
-        corpo = _escape_html(texto_ia) if texto_ia else None
-
-        blocos = []
-        if header:
-            blocos.append(header)
-        if corpo:
-            blocos.append(corpo)
-        if motivo:
-            blocos.append(motivo)
-
-        footer = "\n".join([l for l in linhas if l])
-        if footer:
-            blocos.append(footer)
-
-        # CTA
-        v = (variant or "A").upper()
-        cta_label = self.cta_variants.get(v, self.cta_variants["A"])
-        blocos.append(f'{cta_label}\n{link}')
-
-        msg = "\n\n".join([b for b in blocos if b])
-        msg = _limit_len(msg, 3800)
-
-        return {
-            "text": msg,
-            "parse_mode": self.parse_mode,
-            "disable_web_page_preview": False,
-        }
-
-    def send_message(self, payload: Dict[str, Any]) -> Optional[int]:
-        url = f"{TELEGRAM_API}/bot{self.bot_token}/sendMessage"
-        data = {
-            "chat_id": self.chat_id,
-            "text": payload["text"],
-            "parse_mode": payload.get("parse_mode", "HTML"),
-            "disable_web_page_preview": payload.get("disable_web_page_preview", True),
-        }
-
-        # Primeira tentativa (HTML)
+    def _send(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self.base}/sendMessage"
+        r = requests.post(url, json=payload, timeout=self.timeout)
         try:
-            r = self.session.post(url, data=data, timeout=self.timeout)
-            if r.status_code == 200:
-                j = r.json()
-                return j.get("result", {}).get("message_id")
-            # Se der parse error, tenta sem parse_mode
-            desc = ""
+            j = r.json()
+        except Exception:
+            j = {}
+        if r.status_code != 200:
+            desc = j.get("description") or r.text
+            log.error("Telegram erro %s: %s", r.status_code, desc)
+        r.raise_for_status()
+        return j
+
+    def send(self, title: str, price_brl: float, store: str, rating: Optional[float], sales: Optional[int],
+             link: str, cta: str, variant: str, allow_preview: bool = True) -> bool:
+        """Tenta enviar com HTML; se der 400, reenviar sem parse_mode e/ou dividido."""
+        # Monta mensagem
+        t = _escape_html_text(title)
+        s = _escape_html_text(store)
+        cta_txt = _escape_html_text(cta)
+        price = f"R$ {price_brl:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        meta = []
+        if rating is not None:
+            meta.append(f"⭐️ {rating:.1f}+")
+        if sales is not None:
+            meta.append(f"{sales}+ vendidos")
+        meta_line = " • ".join(meta) if meta else ""
+
+        url = _safe_url(link)
+        msg_html = f"<b>{t}</b>\n\nPreço: <b>{price}</b>\nLoja: {s}\n{meta_line}\n\n<a href=\"{url}\">{cta_txt}</a> • Variante: {variant}"
+
+        payload = {
+            "chat_id": self.chat_id,
+            "text": msg_html[:3900],
+            "parse_mode": "HTML",
+            "disable_web_page_preview": (not allow_preview)
+        }
+        try:
+            self._send(payload)
+            return True
+        except requests.HTTPError as e:
+            # Fallback 1: enviar sem parse_mode (texto puro com link em linha separada)
+            log.warning("HTML falhou, tentando texto puro. Motivo: %s", str(e))
+            plain = f"{title}\n\nPreço: {price}\nLoja: {store}\n{meta_line}\n\n{cta}:\n{url}\nVariante: {variant}"
+            payload2 = {
+                "chat_id": self.chat_id,
+                "text": plain[:3900],
+                "disable_web_page_preview": (not allow_preview)
+            }
             try:
-                desc = r.json().get("description", "")
-            except Exception:
-                desc = r.text
-            if "can't parse entities" in (desc or "").lower():
-                logger.warning("Telegram parse error — reenviando sem parse_mode.")
-                data.pop("parse_mode", None)
-                r2 = self.session.post(url, data=data, timeout=self.timeout)
-                if r2.status_code == 200:
-                    j = r2.json()
-                    return j.get("result", {}).get("message_id")
-                else:
-                    logger.error("Telegram 2ª tentativa falhou: %s", r2.text)
-            else:
-                logger.error("Telegram erro %s: %s", r.status_code, desc)
-        except requests.HTTPError as he:
-            logger.error("HTTPError Telegram: %s", getattr(he.response, "text", str(he)))
-        except Exception as e:
-            logger.error("Erro Telegram: %s", e)
-        return None
+                self._send(payload2)
+                return True
+            except requests.HTTPError as e2:
+                log.error("Falha também no texto puro: %s", str(e2))
+                # Fallback 2: mensagem mínima (reduzir risco de parse/limites)
+                minimal = f"{title} — {price}\n{url}"
+                payload3 = {"chat_id": self.chat_id, "text": minimal[:3800], "disable_web_page_preview": True}
+                try:
+                    self._send(payload3)
+                    return True
+                except requests.HTTPError as e3:
+                    log.error("Falha no fallback mínimo: %s", str(e3))
+                    return False

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shopee Offer Bot • Dashboard</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>📈 Shopee Offer Bot — Dashboard</h1>
+    <div id="updated"></div>
+  </header>
+
+  <section id="kpis">
+    <div class="kpi"><div class="kpi-label">Pedidos</div><div id="kpi-orders" class="kpi-value">—</div></div>
+    <div class="kpi"><div class="kpi-label">Itens</div><div id="kpi-items" class="kpi-value">—</div></div>
+    <div class="kpi"><div class="kpi-label">Comissão líquida</div><div id="kpi-net" class="kpi-value">—</div></div>
+    <div class="kpi"><div class="kpi-label">Comissão / pedido</div><div id="kpi-avg" class="kpi-value">—</div></div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Série temporal (comissão/dia)</h2>
+      <div id="chart-timeseries" class="chart"></div>
+    </div>
+    <div class="card">
+      <h2>A/B Testing</h2>
+      <div id="chart-ab-orders" class="chart"></div>
+      <div id="chart-ab-net" class="chart"></div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Top Categorias por Comissão</h2>
+      <div id="chart-cats" class="chart"></div>
+    </div>
+    <div class="card">
+      <h2>Top Lojas por Comissão</h2>
+      <div id="chart-shops" class="chart"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Top Produtos</h2>
+    <table id="tbl-products">
+      <thead><tr><th>Produto</th><th>Loja</th><th>Quantidade</th><th>Comissão</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Posts recentes</h2>
+    <table id="tbl-posts">
+      <thead><tr><th>Data</th><th>Item</th><th>Categoria</th><th>Variante</th><th>CTA</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card" id="ai-insights" style="display:none;">
+    <h2>Insights da IA</h2>
+    <div id="insights-text">—</div>
+  </section>
+
+  <footer>
+    <small>Gerado automaticamente via GitHub Actions • 100% estático • GitHub Pages</small>
+  </footer>
+
+  <script src="./app.js"></script>
+</body>
+</html>

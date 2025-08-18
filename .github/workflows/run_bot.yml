@@ -1,3 +1,4 @@
+
 name: Shopee Offer Bot
 
 on:
@@ -21,6 +22,11 @@ concurrency:
   group: shopee-offer-bot
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -31,7 +37,6 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-
       DB_PATH: data/bot.db
       QUANTIDADE_DE_POSTS_POR_EXECUCAO: 6
       PAGINAS_A_VERIFICAR: 2
@@ -42,9 +47,9 @@ jobs:
       COOLDOWN_REPOSTAGEM_DIAS: "5"
       MAX_CATEGORY_SHARE: "0.5"
       DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
-      IA_TOP_K: "10"         # chama IA só para os 10 melhores
-      IA_BATCH_SIZE: "10"    # 1 chamada se houver até 10 itens
-      IA_ENABLED: "1"        # troque para "0" se quiser desativar IA temporariamente
+      IA_ENABLED: "1"
+      IA_TOP_K: "6"
+      IA_BATCH_SIZE: "6"
 
     steps:
       - name: Checkout
@@ -77,7 +82,6 @@ jobs:
       - name: Ensure folders & package init
         run: |
           mkdir -p data sql_migrations shopee_monorepo_modules
-          # garante import absoluto mesmo sem namespace package
           if [ ! -f shopee_monorepo_modules/__init__.py ]; then
             echo "" > shopee_monorepo_modules/__init__.py
           fi
@@ -85,14 +89,6 @@ jobs:
       - name: Apply DB migration via Python (no sqlite3 CLI)
         run: |
           python migrate_db.py --db "${{ env.DB_PATH }}" --sql sql_migrations/001_add_conversions.sql
-
-      - name: Optional keywords.txt (fallback)
-        run: |
-          if [ ! -f keywords.txt ]; then
-            echo "gadgets" > keywords.txt
-            echo "cozinha" >> keywords.txt
-            echo "periféricos" >> keywords.txt
-          fi
 
       - name: Sync conversions (last 7 days)
         env:
@@ -122,3 +118,40 @@ jobs:
         with:
           path: data
           key: bot-db-${{ github.run_id }}
+
+  dashboard:
+    needs: run
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download DB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bot-db
+          path: data
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Build static dashboard (JSON + optional AI insights)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python site_builder.py --db data/bot.db --out site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
