@@ -9,8 +9,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: "5 13 * * *"
-    - cron: "5 20 * * *"
+    - cron: "5 10,15,21,00 * * *"
   push:
     branches: [ main ]
     paths:
