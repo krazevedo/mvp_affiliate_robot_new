@@ -349,7 +349,7 @@ def compact_name(product_name: str) -> str:
     """Remove ruído e encurta o nome mantendo marca + substantivo principal."""
     s = (product_name or "").strip()
     # remover termos redundantes comuns
-    s = re.sub(r"\b(?i)(original|novo|gamer|bluetooth|wireless|com fio|sem fio|rgb|led|headset)\b", "", s)
+    s = re.sub(r"\b(original|novo|gamer|bluetooth|wireless|com fio|sem fio|rgb|led|headset)\b", "", s, flags=re.I)
     # normaliza espaços
     s = re.sub(r"\s{2,}", " ", s).strip()
     # limitar para ~8 palavras para caber no mobile
