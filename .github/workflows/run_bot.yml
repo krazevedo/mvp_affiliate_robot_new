@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: "5 10,15,21,00 * * *"
+    - cron: "5 10,12,15,19,21,00 * * *"
   push:
     branches: [ main ]
     paths:
@@ -37,7 +37,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       DB_PATH: data/bot.db
-      QUANTIDADE_DE_POSTS_POR_EXECUCAO: 6
+      QUANTIDADE_DE_POSTS_POR_EXECUCAO: 3
       PAGINAS_A_VERIFICAR: 2
       ITENS_POR_PAGINA: 15
       MIN_RATING: "4.7"

@@ -76,18 +76,67 @@ CATS = [
 ]
 
 EMOJI_BY_CAT = {
-    "mouse/teclado/periféricos": "🎮",
-    "smartwatch/wearables": "⌚",
-    "caixa de som/speaker": "🔊",
-    "projetor": "📽️",
-    "cozinha (airfryer etc.)": "🍟",
-    "câmera/segurança": "📹",
-    "papelaria": "🖊️",
-    "outros": "✨",
+     # Áudio & música
+    "audio": "🔊",
+    "fone": "🎧",
+    "microfone": "🎙️",
+
+    # Mobile & energia
+    "mobile": "📱",
+    "energia": "🔋",
+    "carregador": "🔌",
+
+    # Wearables
+    "wearable": "⌚",
+
+    # Periféricos & games & foto/vídeo
+    "teclado": "⌨️",
+    "mouse": "🖱️",
+    "headset": "🎧",
+    "controle": "🎮",
+    "ring light": "💡",
+    "drone": "🚁",
+    "tv/suporte": "📺",
+
+    # Casa & cozinha
+    "cozinha": "🍳",
+    "cama/banho": "🛏️",
+    "cortina": "🪟",
+    "organizadores": "🧺",
+    "umidificador": "🌫️",
+    "ferramentas": "🧰",
+    "segurança": "📹",
+    "iluminação": "🔦",
+
+    # Moda (fem/masc/unissex)
+    "moda feminina": "👗",
+    "moda masculina": "👕",
+    "calcados": "👟",
+    "bota": "👢",
+    "acessórios": "🧢",
+    "bolsas": "👜",
+    "fitness/roupa": "🏃‍♀️",
+
+    # Beleza & skincare
+    "skincare": "🧴",
+    "maquiagem": "💄",
+    "cabelos": "💇‍♀️",
+    "perfume": "✨",
+
+    # Bebê
+    "bebe": "👶",
 }
 
 def tag_categoria(name: str) -> str:
     n = (name or "").lower()
+    if any(k in n for k in ["blusa", "alça única", "regata"]): return "moda feminina"
+    if any(k in n for k in ["bermuda", "cargo"]):
+        return "moda masculina" if "masc" in n or "mascul" in n else "moda feminina"
+    if any(k in n for k in ["calça flare", "cintura alta", "levanta bumbum"]): return "moda feminina"
+    if any(k in n for k in ["lençol", "jogo de lençol", "400 fios", "queen"]): return "cama/banho"
+    if any(k in n for k in ["difusor", "umidificador", "aromatizador", "ultrasson"]): return "aromaterapia/umidificador"
+    if any(k in n for k in ["conjunto fitness", "legging", "top fitness"]): return "fitness/roupa"
+    if any(k in n for k in ["creatina", "creapure"]): return "suplementos"
     for cat, pat in CATS:
         if re.search(pat, n):
             return cat
@@ -432,15 +481,37 @@ SPEC_PATTERNS = [
 ]
 
 def derive_hint(name: str) -> Optional[str]:
-    n = name or ""
-    for pat, fmt in SPEC_PATTERNS:
-        m = pat.search(n)
-        if m:
-            try:
-                return fmt(m)
-            except Exception:
-                continue
-    return None
+    hints = []
+    n = name.lower()
+
+    # moda
+    if "alça única" in n: hints.append("alça única")
+    if "cintura alta" in n: hints.append("cintura alta")
+    if "flare" in n: hints.append("modelagem flare")
+    if "cargo" in n: hints.append("bolsos utilitários")
+    if "100% algod" in n: hints.append("100% algodão")
+
+    # cama/banho
+    m = re.search(r"(200|300|400|600)\\s*fios", n)
+    if m: hints.append(f"{m.group(1)} fios")
+    if "queen" in n: hints.append("Queen")
+
+    # aromaterapia
+    if "ultrasson" in n: hints.append("ultrassônico")
+    if "umidificador" in n: hints.append("umidificador 2 em 1")
+
+    # fitness
+    if "legging" in n: hints.append("legging")
+    if "top" in n: hints.append("top")
+    if "cós alto" in n or "cintura alta" in n: hints.append("cós alto")
+
+    # suplementos
+    if "creatina" in n: hints.append("creatina monohidratada")
+    if "mastig" in n: hints.append("mastigável")
+    m = re.search(r"(\\d{2,3})\\s*(comp|tabs|comprimidos)", n)
+    if m: hints.append(f"{m.group(1)} comprimidos")
+
+    return ", ".join(dict.fromkeys(hints))  # remove duplicatas mantendo ordem
 
 GENERIC_PHRASES = [
     "com ótimo custo-benefício no dia a dia",
@@ -504,6 +575,7 @@ def heuristic_copies(prod: Dict[str, Any]) -> Dict[str, Any]:
     name = str(prod.get("productName") or "Oferta").strip()
     cat = tag_categoria(name)
     hint = derive_hint(name)
+    add = f" — {hint}" if hint else ""
 
     if "cetim" in name.lower() or "touca" in name.lower() or "gorro" in name.lower():
         a = "menos frizz e fios protegidos durante a noite"
@@ -517,6 +589,24 @@ def heuristic_copies(prod: Dict[str, Any]) -> Dict[str, Any]:
     elif cat == "cozinha (airfryer etc.)":
         a = "menos sujeira e praticidade no preparo"
         b = "reutilizável e fácil de limpar"
+    elif cat == "moda feminina":
+        a = "modelagem que valoriza a silhueta" + add
+        b = "caimento leve para looks versáteis" + add
+    elif cat == "moda masculina":
+        a = "bolsos utilitários com visual casual" + add
+        b = "conforto e praticidade no dia a dia" + add
+    elif cat == "cama/banho":
+        a = "toque macio e acabamento premium" + add
+        b = "noites mais confortáveis" + add
+    elif cat == "aromaterapia/umidificador":
+        a = "névoa fria silenciosa para perfumar o ambiente" + add
+        b = "2 em 1: aromatiza e umidifica" + add
+    elif cat == "fitness/roupa":
+        a = "compressão leve e cós alto seguro" + add
+        b = "tecido que respira para treinos confortáveis" + add
+    elif cat == "suplementos":
+        a = "praticidade no consumo diário" + add
+        b = "formato fácil de levar na rotina" + add
     else:
         a = "praticidade para o dia a dia"
         b = "funcional e versátil"
