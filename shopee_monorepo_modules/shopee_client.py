@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import time
+import hmac
 import hashlib
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -29,47 +31,61 @@ def _make_session() -> requests.Session:
     s.headers.update({"User-Agent": UA})
     return s
 
+def _hmac_sha256_hex(secret: str, message: str) -> str:
+    return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
 class ShopeeClient:
     """
     Cliente resiliente para a GraphQL de Afiliados da Shopee.
 
-    Assinaturas testadas (em ordem):
-      - v2_payload: sha256(partner_id + ts + payload_json + api_key)
-      - v3_path:    sha256(partner_id + ts + "/graphql" + payload_json + api_key)
-      - v1_min:     sha256(partner_id + ts + api_key)
+    Assinaturas testadas (todas com HMAC-SHA256 usando api_key como *secret*):
+      - v2_payload: sign(partner_id + ts + payload_json)
+      - v3_path:    sign(partner_id + ts + "/graphql" + payload_json)
+      - v1_min:     sign(partner_id + ts)
+
+    Você pode forçar um modo setando SHOPEE_AUTH_MODE = v2_payload | v3_path | v1_min
     """
     def __init__(self, partner_id: str, api_key: str, session: Optional[requests.Session] = None) -> None:
         self.partner_id = partner_id.strip()
         self.api_key = api_key.strip()
         self.session = session or _make_session()
-        self.last_auth_mode: Optional[str] = None  # lembra o modo que funcionou
+        self.last_auth_mode: Optional[str] = None
 
-    # ---- Assinaturas --------------------------------------------------------
-    def _auth_header(self, payload: Dict[str, Any], mode: str) -> str:
-        ts = int(time.time())
+        forced = os.getenv("SHOPEE_AUTH_MODE", "").strip()
+        self.forced_mode = forced if forced in ("v2_payload", "v3_path", "v1_min") else None
+        if self.forced_mode:
+            LOGGER.info("Forçando modo de assinatura: %s", self.forced_mode)
+
+    # ---- Assinaturas (HMAC) -------------------------------------------------
+    def _auth_header(self, payload: Dict[str, Any], mode: str, ts: int) -> str:
         payload_str = json.dumps(payload, separators=(",", ":"))
         if mode == "v2_payload":
-            base = f"{self.partner_id}{ts}{payload_str}{self.api_key}"
+            base = f"{self.partner_id}{ts}{payload_str}"
         elif mode == "v3_path":
-            base = f"{self.partner_id}{ts}{GRAPHQL_PATH}{payload_str}{self.api_key}"
+            base = f"{self.partner_id}{ts}{GRAPHQL_PATH}{payload_str}"
         elif mode == "v1_min":
-            base = f"{self.partner_id}{ts}{self.api_key}"
+            base = f"{self.partner_id}{ts}"
         else:
             raise ValueError(f"Modo de assinatura inválido: {mode}")
-        sign = hashlib.sha256(base.encode("utf-8")).hexdigest()
+        sign = _hmac_sha256_hex(self.api_key, base)
         return f"SHA256 Credential={self.partner_id}, Timestamp={ts}, Signature={sign}"
 
     def _post_graphql_auto(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         body = {"query": query, "variables": variables or {}}
-        # prioriza o último modo válido:
         modes = ["v2_payload", "v3_path", "v1_min"]
-        if self.last_auth_mode in modes:
-            modes.remove(self.last_auth_mode)
-            modes.insert(0, self.last_auth_mode)
+
+        # Força um modo? Coloca ele primeiro e ignora o resto na falha de 401/403/Invalid Signature
+        if self.forced_mode:
+            modes = [self.forced_mode]
+        else:
+            if self.last_auth_mode in modes:
+                modes.remove(self.last_auth_mode)
+                modes.insert(0, self.last_auth_mode)
 
         for mode in modes:
+            ts = int(time.time())  # segundos
             headers = {
-                "Authorization": self._auth_header(body, mode),
+                "Authorization": self._auth_header(body, mode, ts),
                 "Content-Type": "application/json",
             }
             try:
@@ -77,27 +93,26 @@ class ShopeeClient:
                 resp.raise_for_status()
                 data = resp.json()
             except requests.HTTPError as e:
-                # Se for 401/403, tente próximo modo
-                if e.response is not None and e.response.status_code in (401, 403):
-                    LOGGER.warning("HTTP %s com modo %s — tentando próximo", e.response.status_code, mode)
+                # 401/403 geralmente é assinatura -> tenta próximo modo
+                code = e.response.status_code if e.response is not None else None
+                if code in (401, 403):
+                    LOGGER.warning("HTTP %s com modo %s — tentando próximo", code, mode)
                     continue
                 raise
 
-            # Erros GraphQL
-            if "errors" in data and data["errors"]:
-                # Verifica assinatura inválida
+            # Erros GraphQL (estrutura padronizada)
+            if isinstance(data, dict) and data.get("errors"):
                 msg = json.dumps(data["errors"], ensure_ascii=False)
                 if "Invalid Signature" in msg or "Invalid Authorization Header" in msg:
                     LOGGER.warning("GraphQL (%s) retornou assinatura inválida — tentando próximo modo", mode)
                     continue
-                # Outros erros: retorna para o chamador lidar
+                # outros erros: devolve para o chamador lidar
                 return data
 
             # Sucesso
             self.last_auth_mode = mode
             return data
 
-        # Se todos os modos falharem com assinatura inválida
         raise RuntimeError("Falha de autenticação: todos os modos de assinatura retornaram 'Invalid Signature'.")
 
     # ---- Consultas de produtos ---------------------------------------------
