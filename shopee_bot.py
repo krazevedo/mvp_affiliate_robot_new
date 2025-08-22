@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -7,63 +6,35 @@ import sys
 import time
 import json
 import logging
-import hashlib
 import random
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter, Retry
 
-# Dependências internas do projeto (já existentes no seu repo)
 from ai import analyze_products, IAResponse  # type: ignore
 from shopee_monorepo_modules.publisher import TelegramPublisher  # type: ignore
 from shopee_monorepo_modules.ev_signal import compute_ev_signal  # type: ignore
+from shopee_monorepo_modules.shopee_client import ShopeeClient  # <— NOVO
 from rescue_publish import publish_with_rescue  # type: ignore
 from storage import Storage  # type: ignore
 
-# Integração opcional com keywords → categoria/emoji/hints
 try:
     from config_keywords import resolve_meta as kw_resolve_meta  # type: ignore
 except Exception:
-    kw_resolve_meta = None  # fallback seguro
+    kw_resolve_meta = None
 
-# ----------------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("shopee_bot")
 
-# ----------------------------------------------------------------------------
-# Constantes
-# ----------------------------------------------------------------------------
-GRAPHQL_URL = "https://open-api.affiliate.shopee.com.br/graphql"
-USER_AGENT = "Mozilla/5.0 (compatible; ShopeeAffiliateBot/2.0; +github-actions)"
+GENERIC_TOKENS = [
+    r"\boriginal\b", r"\bofficial\b", r"\bnovo\b", r"\bnew\b", r"\bpromo(ção)?\b",
+    r"\bfrete\s*grátis\b", r"\baproveite\b", r"\boferta\b", r"\bdesconto\b",
+]
 
-# ----------------------------------------------------------------------------
-# Sessão HTTP com retry
-# ----------------------------------------------------------------------------
-def make_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST", "HEAD"],
-        respect_retry_after_header=True,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.headers.update({"User-Agent": USER_AGENT})
-    return s
-
-SESSION = make_session()
-
-# ----------------------------------------------------------------------------
-# Helpers de env
-# ----------------------------------------------------------------------------
 def getenv_required(name: str) -> str:
     v = os.getenv(name, "").strip()
     if not v:
@@ -85,14 +56,6 @@ def getenv_float(name: str, default: float) -> float:
 def getenv_bool(name: str, default: bool = False) -> bool:
     v = str(os.getenv(name, str(int(default)))).strip().lower()
     return v in ("1", "true", "yes", "y", "sim")
-
-# ----------------------------------------------------------------------------
-# Normalização e categorização leve (fallback)
-# ----------------------------------------------------------------------------
-GENERIC_TOKENS = [
-    r"\boriginal\b", r"\bofficial\b", r"\bnovo\b", r"\bnew\b", r"\bpromo(ção)?\b",
-    r"\bfrete\s*grátis\b", r"\baproveite\b", r"\boferta\b", r"\bdesconto\b",
-]
 
 def norm_name(name: str) -> str:
     n = (name or "").lower()
@@ -138,44 +101,6 @@ def sanitize_copy(text: str) -> str:
     t = re.sub(r"\s{2,}", " ", t).strip(" -—–•")
     return t
 
-# ----------------------------------------------------------------------------
-# Assinatura Shopee e GraphQL
-# ----------------------------------------------------------------------------
-def build_auth_header(partner_id: str, api_key: str, payload: Dict[str, Any]) -> str:
-    ts = int(time.time())
-    payload_str = json.dumps(payload, separators=(",", ":"))
-    base_string = f"{partner_id}{ts}{payload_str}{api_key}"
-    sign = hashlib.sha256(base_string.encode("utf-8")).hexdigest()
-    return f"SHA256 Credential={partner_id}, Timestamp={ts}, Signature={sign}"
-
-def gql_product_offer_v2(
-    partner_id: str,
-    api_key: str,
-    *, keyword: Optional[str] = None, shop_id: Optional[int] = None,
-    limit: int = 15, page: int = 1
-) -> List[Dict[str, Any]]:
-    assert (keyword is not None) ^ (shop_id is not None), "Forneça keyword OU shop_id"
-    arg = f'keyword: "{keyword}"' if keyword else f"shopId: {int(shop_id)}"
-    query = (
-        "query { productOfferV2("
-        f"{arg}, limit: {int(limit)}, page: {int(page)}"
-        ") { nodes { itemId productName priceMin priceMax offerLink productLink shopName ratingStar sales priceDiscountRate } } }"
-    )
-    body = {"query": query, "variables": {}}
-    headers = {
-        "Authorization": build_auth_header(partner_id, api_key, body),
-        "Content-Type": "application/json",
-    }
-    r = SESSION.post(GRAPHQL_URL, json=body, headers=headers, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if "errors" in data and data["errors"]:
-        raise RuntimeError(f"GraphQL errors: {data['errors']}")
-    return data.get("data", {}).get("productOfferV2", {}).get("nodes", []) or []
-
-# ----------------------------------------------------------------------------
-# Entrada (keywords & shops)
-# ----------------------------------------------------------------------------
 def load_keywords(path: str = "keywords.txt") -> List[str]:
     if not os.path.exists(path):
         return [
@@ -201,9 +126,6 @@ def load_shop_ids() -> List[int]:
             out.append(int(tok))
     return out
 
-# ----------------------------------------------------------------------------
-# Filtros e dedupe
-# ----------------------------------------------------------------------------
 def is_good(prod: Dict[str, Any], *, min_rating: float, min_sales: int, min_discount: float) -> bool:
     try:
         rating = float(prod.get("ratingStar") or 0.0)
@@ -225,10 +147,7 @@ def dedupe_signature(prod: Dict[str, Any]) -> str:
     name_clean = re.sub(r"[^a-z0-9]+", " ", name)
     return f"{name_clean.strip()}__{shop.strip()}"
 
-# ----------------------------------------------------------------------------
-# Coleta híbrida (keywords + shops)
-# ----------------------------------------------------------------------------
-def coletar_ofertas(partner_id: str, api_key: str, keywords: List[str], shop_ids: List[int], pages: int) -> List[Dict[str, Any]]:
+def coletar_ofertas(client: ShopeeClient, keywords: List[str], shop_ids: List[int], pages: int) -> List[Dict[str, Any]]:
     ofertas: List[Dict[str, Any]] = []
     fontes: List[Dict[str, Any]] = ([{"tipo": "keyword", "valor": kw} for kw in keywords] +
                                     [{"tipo": "shopId", "valor": sid} for sid in shop_ids])
@@ -237,9 +156,9 @@ def coletar_ofertas(partner_id: str, api_key: str, keywords: List[str], shop_ids
         for p in range(1, pages + 1):
             try:
                 if fonte["tipo"] == "keyword":
-                    nodes = gql_product_offer_v2(partner_id, api_key, keyword=str(fonte["valor"]), page=p, limit=15)
+                    nodes = client.product_offer_v2_by_keyword(str(fonte["valor"]), page=p, limit=15)
                 else:
-                    nodes = gql_product_offer_v2(partner_id, api_key, shop_id=int(fonte["valor"]), page=p, limit=15)
+                    nodes = client.product_offer_v2_by_shop(int(fonte["valor"]), page=p, limit=15)
             except Exception as e:
                 logger.warning("Falha na busca por %s '%s' (p%d): %s", fonte["tipo"], fonte["valor"], p, e)
                 break
@@ -255,19 +174,14 @@ def coletar_ofertas(partner_id: str, api_key: str, keywords: List[str], shop_ids
                     "ratingStar": n.get("ratingStar"),
                     "sales": n.get("sales"),
                     "priceDiscountRate": n.get("priceDiscountRate"),
-                    # marca a origem por keyword (para emoji/hints)
                     "keyword_origem": fonte["valor"] if fonte["tipo"] == "keyword" else None,
                 })
-            time.sleep(2)
-    # dedupe por assinatura
+            time.sleep(1.5)
     uniq: Dict[str, Dict[str, Any]] = {}
     for p in ofertas:
         uniq[dedupe_signature(p)] = p
     return list(uniq.values())
 
-# ----------------------------------------------------------------------------
-# IA (com fallback heurístico)
-# ----------------------------------------------------------------------------
 def heuristic_copies(prod: Dict[str, Any]) -> Dict[str, str]:
     n = (prod.get("productName") or "").lower()
     if "mouse" in n:
@@ -312,9 +226,6 @@ def score_ia_or_fallback(batch: List[Dict[str, Any]]) -> IAResponse | Dict[str, 
             })
         return {"items": items}
 
-# ----------------------------------------------------------------------------
-# Título curto (emoji + benefício)
-# ----------------------------------------------------------------------------
 def make_headline(product_name: str, benefit: str, *, emoji: Optional[str] = None, hint: Optional[str] = None, max_len: int = 110) -> str:
     base = compact_name(product_name, max_len=max_len)
     benefit = sanitize_copy(remove_redundancy(benefit, product_name))
@@ -327,29 +238,20 @@ def make_headline(product_name: str, benefit: str, *, emoji: Optional[str] = Non
         title = title[:max_len].rsplit(" ", 1)[0]
     return title
 
-# ----------------------------------------------------------------------------
-# Seleção com caps, cooldown e preenchimento garantido (3 fases)
-# ----------------------------------------------------------------------------
 def select_with_caps_and_dedupe(
     ranked: List[Tuple[float, Dict[str, Any], Dict[str, Any]]],
     *, max_posts: int, max_share: float, db: Storage, cooldown_days: int,
     allow_no_cap_on_shortfall: bool, emergency_fill: bool,
     emergency_cooldown_factor: float, max_emergency_reposts: int
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
-    """
-    1) Estrita: cooldown + cap de categoria + dedupe por nome
-    2) Sem cap (mantém cooldown) se faltar completar
-    3) Emergência: relaxa cooldown para uma fração e limita #reposts
-    """
     cap = max(1, int(max_posts * max_share)) if max_posts > 0 else 1
     selected: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     cat_counts: Dict[str, int] = {}
     seen_norm: set[str] = set()
 
-    rejections: List[Tuple[str, float, Dict[str, Any], Dict[str, Any]]] = []  # (reason, final, ia, prod)
+    rejections: List[Tuple[str, float, Dict[str, Any], Dict[str, Any]]] = []
     counters = {"cooldown": 0, "cap": 0, "dup": 0, "other": 0}
 
-    # Passo 1 — estrito
     for final, ia_item, prod in ranked:
         if len(selected) >= max_posts:
             break
@@ -378,7 +280,6 @@ def select_with_caps_and_dedupe(
 
     strict_sel = len(selected)
 
-    # Passo 2 — sem cap (mantém cooldown) se necessário
     nocap_added = 0
     if allow_no_cap_on_shortfall and len(selected) < max_posts:
         for reason, final, ia_item, prod in rejections:
@@ -396,7 +297,6 @@ def select_with_caps_and_dedupe(
             seen_norm.add(norm)
             nocap_added += 1
 
-    # Passo 3 — emergência (relaxa cooldown e limita reposts)
     emergency_added = 0
     if emergency_fill and len(selected) < max_posts:
         relaxed_days = max(0, int(round(cooldown_days * emergency_cooldown_factor)))
@@ -410,7 +310,6 @@ def select_with_caps_and_dedupe(
             last = db.last_posted_at(item_id) or 0.0
             if db.can_repost(item_id, cooldown_days=relaxed_days):
                 pool.append((last, final, ia_item, prod))
-        # nunca postados (last=0) primeiro; depois mais antigos
         pool.sort(key=lambda t: (0 if t[0] == 0 else 1, t[0]))
         used = 0
         for last, final, ia_item, prod in pool:
@@ -430,9 +329,6 @@ def select_with_caps_and_dedupe(
     )
     return selected
 
-# ----------------------------------------------------------------------------
-# Publicação A/B
-# ----------------------------------------------------------------------------
 def pick_variant(rnd: random.Random) -> str:
     return "A" if rnd.random() < 0.5 else "B"
 
@@ -453,18 +349,19 @@ def publish_ranked_ab(
             continue
         pname = str(p.get("productName") or "")
         shop = (p.get("shopName") or "").strip()
-        price = float(p.get("priceMin") or 0.0)
+        try:
+            price = float(p.get("priceMin") or 0.0)
+        except Exception:
+            price = None
         rating = p.get("ratingStar")
         sales = p.get("sales")
         link = p.get("offerLink") or p.get("productLink") or ""
 
-        # IA texts
         text_a = (ia or {}).get("texto_de_venda_a") or heuristic_copies(p)["texto_de_venda_a"]
         text_b = (ia or {}).get("texto_de_venda_b") or heuristic_copies(p)["texto_de_venda_b"]
         variant = pick_variant(rnd)
         benefit = text_a if variant == "A" else text_b
 
-        # Enriquecimento por keyword → emoji + hints específicos
         emoji_override = None
         hint_kw = None
         if kw_resolve_meta:
@@ -478,7 +375,7 @@ def publish_ranked_ab(
         title = make_headline(pname, benefit, emoji=emoji_override, hint=hint_kw)
 
         if dry_run:
-            logger.info("[DRY RUN] %s | %s | R$%.2f | %s", title, shop, price, link)
+            logger.info("[DRY RUN] %s | %s | %s | %s", title, shop, f"R${price:.2f}" if price else "s/ preço", link)
             posted += 1
             db.record_post(iid, variant, message_id=None)
             continue
@@ -507,17 +404,12 @@ def publish_ranked_ab(
 
     return posted
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
 def main() -> int:
-    # Env obrigatórios
     partner_id = getenv_required("SHOPEE_PARTNER_ID")
     api_key = getenv_required("SHOPEE_API_KEY")
     telegram_token = getenv_required("TELEGRAM_BOT_TOKEN")
     telegram_chat = getenv_required("TELEGRAM_CHAT_ID")
 
-    # Env opcionais
     DB_PATH = os.getenv("DB_PATH", "data/bot.db")
     QTD_POSTS = getenv_int("QUANTIDADE_DE_POSTS_POR_EXECUCAO", 6)
     PAGES = getenv_int("PAGINAS_A_VERIFICAR", 2)
@@ -528,25 +420,22 @@ def main() -> int:
     MAX_CATEGORY_SHARE = float(os.getenv("MAX_CATEGORY_SHARE", "0.5"))
     COOLDOWN_DIAS = getenv_int("COOLDOWN_REPOSTAGEM_DIAS", 5)
 
-    # Estratégias de preenchimento garantido
     ALLOW_NO_CAP_ON_SHORTFALL = getenv_bool("ALLOW_NO_CAP_ON_SHORTFALL", True)
     EMERGENCY_FILL_ENABLED = getenv_bool("EMERGENCY_FILL_ENABLED", True)
-    EMERGENCY_COOLDOWN_FACTOR = getenv_float("EMERGENCY_COOLDOWN_FACTOR", 0.6)  # 60% do cooldown
+    EMERGENCY_COOLDOWN_FACTOR = getenv_float("EMERGENCY_COOLDOWN_FACTOR", 0.6)
     MAX_EMERGENCY_REPOSTS = getenv_int("MAX_EMERGENCY_REPOSTS", 2)
 
-    # Entrada
     keywords = load_keywords("keywords.txt")
     shops = load_shop_ids()
 
     logger.info("Coletando ofertas (GraphQL Affiliate)...")
-    ofertas = coletar_ofertas(partner_id, api_key, keywords, shops, PAGES)
+    client = ShopeeClient(partner_id, api_key)
+    ofertas = coletar_ofertas(client, keywords, shops, PAGES)
     logger.info("Coleta bruta: %d ofertas", len(ofertas))
 
-    # Filtros de qualidade
     cand = [p for p in ofertas if is_good(p, min_rating=MIN_RATING, min_sales=MIN_SALES, min_discount=MIN_DISCOUNT)]
     logger.info("Candidatos após filtros de qualidade: %d", len(cand))
 
-    # Dedupe por assinatura
     seen_sig = set()
     deduped = []
     for p in cand:
@@ -561,7 +450,6 @@ def main() -> int:
         logger.info("Sem candidatos após filtros. Nada a publicar.")
         return 0
 
-    # IA por lotes
     BATCH = 10
     ia_by_id: Dict[int, Dict[str, Any]] = {}
     for i in range(0, len(deduped), BATCH):
@@ -578,7 +466,6 @@ def main() -> int:
             except Exception:
                 continue
 
-    # Ranking
     ranked: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
     for p in deduped:
         iid = int(p.get("itemId") or 0)
@@ -589,7 +476,6 @@ def main() -> int:
         except Exception:
             disc = 0.0
         disc_n = max(0.0, min(1.0, disc))
-        ev = 0.0
         try:
             ev = compute_ev_signal(p.get("shopName") or "", p.get("productName") or "")
         except Exception:
@@ -598,7 +484,6 @@ def main() -> int:
         ranked.append((final, ia, p))
     ranked.sort(key=lambda x: x[0], reverse=True)
 
-    # Persistência e publisher
     db = Storage(DB_PATH)
     pub = TelegramPublisher(token=telegram_token, chat_id=telegram_chat)
 
@@ -619,7 +504,6 @@ def main() -> int:
         pub, db, selected, max_posts=QTD_POSTS, cooldown_days=COOLDOWN_DIAS, dry_run=DRY_RUN
     )
 
-    # RESGATE se necessário
     if posted < QTD_POSTS:
         logger.warning("Ativando modo RESGATE: coletando mais itens com filtros relaxados...")
         try:
